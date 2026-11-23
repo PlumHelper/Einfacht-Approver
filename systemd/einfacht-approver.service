@@ -1,0 +1,19 @@
+[Unit]
+Description=Einfacht Isolated Approver v2 Control Plane
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/einfacht-approver
+ExecStart=/usr/bin/python3 -m approver --host 127.0.0.1 --port 18443
+Restart=on-failure
+RestartSec=2
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/einfacht-approver
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+[Install]
+WantedBy=multi-user.target

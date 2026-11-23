@@ -1,0 +1,622 @@
+"""SQLite WAL-backed store with composite indexes, RBAC, and atomic suite_seq concurrency control."""
+from __future__ import annotations
+
+import json
+import sqlite3
+import threading
+import time
+import uuid
+from pathlib import Path
+from typing import Any
+
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+from . import crypto
+
+_SCHEMA_SQL = """
+PRAGMA journal_mode=WAL;
+PRAGMA synchronous=NORMAL;
+PRAGMA busy_timeout=5000;
+
+CREATE TABLE IF NOT EXISTS requests (
+    id TEXT PRIMARY KEY,
+    display_id TEXT NOT NULL,
+    repo TEXT NOT NULL,
+    agent_id TEXT NOT NULL,
+    action TEXT NOT NULL,
+    target_path TEXT NOT NULL,
+    prev_sha256 TEXT NOT NULL,
+    target_sha256 TEXT NOT NULL,
+    diff_summary TEXT NOT NULL,
+    target_content TEXT NOT NULL,
+    suite_seq INTEGER,
+    status TEXT NOT NULL,
+    deny_reason TEXT NOT NULL DEFAULT '',
+    decided_by TEXT NOT NULL DEFAULT '',
+    receipt_json TEXT,
+    created_at INTEGER NOT NULL,
+    decided_at INTEGER
+);
+
+CREATE INDEX IF NOT EXISTS idx_req_dedup
+    ON requests(repo, action, target_path, prev_sha256, target_sha256, created_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_req_repo_status
+    ON requests(repo, status, created_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_req_display
+    ON requests(display_id);
+
+CREATE TABLE IF NOT EXISTS delegations (
+    id TEXT PRIMARY KEY,
+    repo TEXT NOT NULL,
+    action TEXT NOT NULL,
+    approver TEXT NOT NULL,
+    expires_at INTEGER NOT NULL,
+    created_at INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_deleg_lookup
+    ON delegations(repo, action, expires_at DESC);
+
+CREATE TABLE IF NOT EXISTS revocations (
+    id TEXT PRIMARY KEY,
+    revoked_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS sessions (
+    token TEXT PRIMARY KEY,
+    approver TEXT NOT NULL,
+    repos_json TEXT NOT NULL,
+    expires_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS repo_counters (
+    repo TEXT PRIMARY KEY,
+    last_seq INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS suite_releases (
+    upstream_repo TEXT PRIMARY KEY,
+    last_seq INTEGER NOT NULL,
+    tree_sha256 TEXT NOT NULL,
+    updated_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS approver_keychains (
+    approver TEXT NOT NULL,
+    repo TEXT NOT NULL,
+    bound_at INTEGER NOT NULL,
+    PRIMARY KEY (approver, repo)
+);
+
+CREATE TABLE IF NOT EXISTS thread_tokens (
+    token_hash TEXT PRIMARY KEY,
+    thread_id TEXT NOT NULL,
+    token_plain TEXT NOT NULL DEFAULT '',
+    created_at INTEGER NOT NULL
+);
+"""
+
+
+def can_access_repo(allowed_repos: frozenset[str], repo: str) -> bool:
+    """True iff `allowed_repos` grants access to `repo` (`*` or exact match)."""
+    return "*" in allowed_repos or repo in allowed_repos
+
+
+def is_suite_owner(allowed_repos: frozenset[str], upstream_repo: str) -> bool:
+    """True iff approver has explicit ownership of `upstream_repo` or wildcard `*`."""
+    return "*" in allowed_repos or upstream_repo in allowed_repos
+
+
+class SuiteSeqConflictError(Exception):
+    """Raised when a concurrent `suite.release` collides with or regresses `last_seq`."""
+
+
+class ForbiddenError(Exception):
+    """Raised when an approver lacks RBAC permission for the target repo/action."""
+
+
+class ApproverStore:
+    """Thread-safe SQLite WAL store for multi-repo Ed25519 approvals."""
+
+    def __init__(self, state_dir: Path, pass_file: Path):
+        self.state_dir = Path(state_dir)
+        self.pass_file = Path(pass_file)
+        self.state_dir.mkdir(parents=True, exist_ok=True)
+        self.state_dir.chmod(0o700)
+        self.db_path = self.state_dir / "approver.db"
+        self.priv: Ed25519PrivateKey
+        self.pub_pem_str: str
+        self.key_id: str
+        self.priv, self.pub_pem_str, self.key_id = crypto.load_or_create_keypair(self.state_dir)
+        self._local = threading.local()
+        self._conns: list[sqlite3.Connection] = []
+        self._write_lock = threading.RLock()
+        self._auth_cache_sig: tuple[int, int] | None = None
+        self._auth_cache: dict[str, tuple[str, frozenset[str]] | None] = {}
+        self._init_db()
+
+    def _conn(self) -> sqlite3.Connection:
+        conn = getattr(self._local, "conn", None)
+        if conn is None:
+            conn = sqlite3.connect(str(self.db_path), timeout=10.0, isolation_level=None, check_same_thread=False)
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA synchronous=NORMAL")
+            conn.execute("PRAGMA busy_timeout=5000")
+            self._local.conn = conn
+            with self._write_lock:
+                self._conns.append(conn)
+        return conn
+
+    def close(self) -> None:
+        """Close all tracked SQLite connections."""
+        import contextlib
+        for conn in self._conns:
+            with contextlib.suppress(sqlite3.Error):
+                conn.close()
+        self._conns.clear()
+        self._local.conn = None
+
+    def _init_db(self) -> None:
+        import contextlib
+        with self._write_lock:
+            c = self._conn()
+            c.executescript(_SCHEMA_SQL)
+            with contextlib.suppress(sqlite3.OperationalError):
+                c.execute("ALTER TABLE thread_tokens ADD COLUMN token_plain TEXT NOT NULL DEFAULT ''")
+            if self.db_path.is_file():
+                self.db_path.chmod(0o600)
+
+    def close_thread_conn(self) -> None:
+        """Close thread-local SQLite connection if open."""
+        conn = getattr(self._local, "conn", None)
+        if conn is not None:
+            conn.close()
+            self._local.conn = None
+
+    def pub_pem(self) -> str:
+        return self.pub_pem_str
+
+    def key_info(self) -> tuple[str, str]:
+        return self.pub_pem_str, self.key_id
+
+    def bind_keychain(self, approver: str, repo: str) -> None:
+        """Bind `repo` to `approver`'s keychain."""
+        self.bind_keychain_many(approver, [repo])
+
+    def bind_keychain_many(self, approver: str, repos: list[str] | tuple[str, ...]) -> list[str]:
+        """Bind multiple `repos` to `approver`'s keychain in one transaction."""
+        cleaned = sorted({r.strip() for r in repos if r and r.strip()})
+        if not cleaned:
+            return []
+        now = int(time.time())
+        with self._write_lock:
+            c = self._conn()
+            c.execute("BEGIN IMMEDIATE")
+            try:
+                for repo in cleaned:
+                    c.execute(
+                        "INSERT OR IGNORE INTO approver_keychains(approver, repo, bound_at) VALUES(?,?,?)",
+                        (approver, repo, now),
+                    )
+                c.execute("COMMIT")
+            except Exception:
+                c.execute("ROLLBACK")
+                raise
+        return cleaned
+
+    def unbind_keychain(self, approver: str, repo: str) -> None:
+        """Remove `repo` from `approver`'s keychain."""
+        with self._write_lock:
+            self._conn().execute(
+                "DELETE FROM approver_keychains WHERE approver=? AND repo=?",
+                (approver, repo),
+            )
+
+    def list_all_keychains(self) -> dict[str, list[str]]:
+        """Return `{approver: [repo, ...]}` across all keychains."""
+        rows = self._conn().execute(
+            "SELECT approver, repo FROM approver_keychains ORDER BY approver, repo"
+        ).fetchall()
+        out: dict[str, list[str]] = {}
+        for r in rows:
+            out.setdefault(str(r["approver"]), []).append(str(r["repo"]))
+        return out
+
+    def issue_thread_token(self, thread_id: str) -> str:
+        """Issue a bearer token bound directly to `thread_id` (zero keypair/challenge)."""
+        import hashlib
+        import secrets
+        tok = "ef-tok-" + secrets.token_urlsafe(24)
+        tok_hash = hashlib.sha256(tok.encode("utf-8")).hexdigest()
+        with self._write_lock:
+            c = self._conn()
+            c.execute("DELETE FROM thread_tokens WHERE thread_id=?", (thread_id,))
+            c.execute(
+                "INSERT INTO thread_tokens(token_hash, thread_id, token_plain, created_at) VALUES(?,?,?,?)",
+                (tok_hash, thread_id, tok, int(time.time())),
+            )
+        return tok
+
+    def list_thread_tokens(self, allowed_repos: frozenset[str]) -> dict[str, str]:
+        """Return `{thread_id: token_plain}` strictly for wildcard admin (`*` in `allowed_repos`)."""
+        if "*" not in allowed_repos:
+            raise ForbiddenError("only wildcard admin can view thread tokens")
+        rows = self._conn().execute(
+            "SELECT thread_id, token_plain FROM thread_tokens ORDER BY thread_id"
+        ).fetchall()
+        return {str(r["thread_id"]): str(r["token_plain"] or "") for r in rows}
+
+    def bearer_identity(self, token: str | None) -> tuple[str, frozenset[str]] | None:
+        """Resolve a `thread_tokens` bearer token to `(thread_id, keychain_repos)`."""
+        import hashlib
+        clean = (token or "").strip()
+        if not clean:
+            return None
+        tok_hash = hashlib.sha256(clean.encode("utf-8")).hexdigest()
+        row = self._conn().execute(
+            "SELECT thread_id FROM thread_tokens WHERE token_hash=?",
+            (tok_hash,),
+        ).fetchone()
+        if row is not None:
+            tid = str(row["thread_id"])
+            return tid, self._effective_repos(tid, frozenset())
+        return self.session_identity(clean)
+
+    def _effective_repos(self, approver: str, static_repos: frozenset[str]) -> frozenset[str]:
+        if "*" in static_repos:
+            return static_repos
+        rows = self._conn().execute(
+            "SELECT repo FROM approver_keychains WHERE approver=?",
+            (approver,),
+        ).fetchall()
+        kc = {str(r["repo"]) for r in rows}
+        return static_repos | frozenset(kc)
+
+    def verify_approver(self, passphrase: str) -> tuple[str, frozenset[str]] | None:
+        import hashlib
+        if not self.pass_file.is_file():
+            return None
+        try:
+            st = self.pass_file.stat()
+            sig = (st.st_mtime_ns, st.st_size)
+            pw_key = hashlib.sha256(passphrase.encode("utf-8")).hexdigest()
+            with self._write_lock:
+                if self._auth_cache_sig != sig:
+                    self._auth_cache.clear()
+                    self._auth_cache_sig = sig
+                if pw_key in self._auth_cache:
+                    cached = self._auth_cache[pw_key]
+                    if cached is None:
+                        return None
+                    return cached[0], self._effective_repos(cached[0], cached[1])
+            raw = self.pass_file.read_text("utf-8")
+        except OSError:
+            return None
+        ident = crypto.verify_passphrase(raw, passphrase)
+        with self._write_lock:
+            self._auth_cache[pw_key] = ident
+        if ident is None:
+            return None
+        return ident[0], self._effective_repos(ident[0], ident[1])
+
+    def create_session(self, approver: str, repos: frozenset[str], ttl_sec: int = 86400) -> str:
+        import secrets
+        tok = secrets.token_urlsafe(32)
+        exp = int(time.time()) + ttl_sec
+        with self._write_lock:
+            c = self._conn()
+            c.execute("DELETE FROM sessions WHERE expires_at <= ?", (int(time.time()),))
+            c.execute(
+                "INSERT INTO sessions(token, approver, repos_json, expires_at) VALUES(?,?,?,?)",
+                (tok, approver, json.dumps(sorted(repos)), exp),
+            )
+        return tok
+
+    def session_identity(self, token: str | None) -> tuple[str, frozenset[str]] | None:
+        if not token:
+            return None
+        row = self._conn().execute(
+            "SELECT approver, repos_json, expires_at FROM sessions WHERE token = ?",
+            (token,),
+        ).fetchone()
+        if row is None or int(row["expires_at"]) <= int(time.time()):
+            return None
+        ap = str(row["approver"])
+        return ap, self._effective_repos(ap, frozenset(json.loads(row["repos_json"])))
+
+    def delete_session(self, token: str) -> None:
+        with self._write_lock:
+            self._conn().execute("DELETE FROM sessions WHERE token = ?", (token,))
+
+    def _row_to_dict(self, row: sqlite3.Row) -> dict[str, Any]:
+        d = dict(row)
+        raw_rec = d.pop("receipt_json", None)
+        if raw_rec:
+            d["receipt"] = json.loads(raw_rec)
+        return d
+
+    def _sign_req_receipt(self, req: dict[str, Any], *, decided_by: str,
+                          delegation_id: str | None = None, ttl_sec: int = 3600) -> dict[str, Any]:
+        now = int(time.time())
+        payload: dict[str, Any] = {
+            "id": f"rec-{uuid.uuid4().hex[:12]}",
+            "req_id": req["id"],
+            "repo": req["repo"],
+            "action": req["action"],
+            "target": req["target_path"],
+            "target_path": req["target_path"],
+            "prev_sha256": req["prev_sha256"],
+            "target_sha256": req["target_sha256"],
+            "decided_by": decided_by,
+            "issued_at": now,
+            "expires_at": now + ttl_sec,
+        }
+        if req.get("suite_seq") is not None:
+            payload["suite_seq"] = int(req["suite_seq"])
+        if delegation_id:
+            payload["delegation_id"] = delegation_id
+        return crypto.sign_receipt(self.priv, payload)
+
+    def submit_request(self, body: dict[str, Any]) -> tuple[dict[str, Any], bool]:
+        """Insert or deduplicate a request. Returns `(request_dict, is_new_pending)`."""
+        repo = str(body.get("repo") or "").strip()
+        action = str(body.get("action") or "").strip()
+        target_path = str(body.get("target_path") or "").strip()
+        prev_sha = str(body.get("prev_sha256") or "NONE")
+        target_sha = str(body.get("target_sha256") or "")
+        agent_id = str(body.get("agent_id") or "agent")
+        diff_summary = str(body.get("diff_summary") or "")[:16000]
+        target_content = str(body.get("target_content") or "")[:32000]
+        raw_seq = body.get("suite_seq")
+        if raw_seq is not None:
+            if isinstance(raw_seq, bool):
+                raise ValueError("invalid suite_seq")
+            suite_seq = int(raw_seq)
+        else:
+            suite_seq = None
+        now = int(time.time())
+
+        with self._write_lock:
+            c = self._conn()
+            c.execute("BEGIN IMMEDIATE")
+            try:
+                existing = c.execute(
+                    """SELECT * FROM requests
+                       WHERE repo=? AND action=? AND target_path=? AND prev_sha256=? AND target_sha256=?
+                         AND COALESCE(suite_seq, -1) = COALESCE(?, -1)
+                       ORDER BY created_at DESC LIMIT 1""",
+                    (repo, action, target_path, prev_sha, target_sha, suite_seq),
+                ).fetchone()
+                if existing is not None:
+                    ex = self._row_to_dict(existing)
+                    if ex["status"] == "denied":
+                        c.execute("COMMIT")
+                        return {
+                            **ex,
+                            "status": "rejected_duplicate",
+                            "original_id": ex["id"],
+                        }, False
+                    if ex["status"] == "pending":
+                        c.execute("COMMIT")
+                        return ex, False
+                    if ex["status"] in ("approved", "approved_delegated"):
+                        rec_exp = int((ex.get("receipt") or {}).get("expires_at") or 0)
+                        if rec_exp > now:
+                            c.execute("COMMIT")
+                            return ex, False
+
+                if action == "suite.release":
+                    if suite_seq is None or suite_seq <= 0:
+                        raise SuiteSeqConflictError("suite_seq must be a positive integer")
+                    rel_row = c.execute(
+                        "SELECT last_seq FROM suite_releases WHERE upstream_repo=?",
+                        (repo,),
+                    ).fetchone()
+                    if rel_row is not None and suite_seq <= int(rel_row["last_seq"]):
+                        raise SuiteSeqConflictError(
+                            f"suite_seq {suite_seq} <= last_released_seq {rel_row['last_seq']}"
+                        )
+
+                cnt_row = c.execute(
+                    "SELECT last_seq FROM repo_counters WHERE repo=?",
+                    (repo,),
+                ).fetchone()
+                next_num = (int(cnt_row["last_seq"]) if cnt_row else 0) + 1
+                c.execute(
+                    "INSERT OR REPLACE INTO repo_counters(repo, last_seq) VALUES(?,?)",
+                    (repo, next_num),
+                )
+                req_id = f"req-{uuid.uuid4().hex[:12]}"
+                display_id = f"{repo}#{next_num}"
+
+                status = "pending"
+                decided_by = ""
+                decided_at = None
+                receipt = None
+
+                if action != "suite.release":
+                    deleg = c.execute(
+                        """SELECT d.* FROM delegations d
+                           WHERE d.repo=? AND d.action=? AND d.expires_at > ?
+                             AND d.id NOT IN (SELECT id FROM revocations)
+                           ORDER BY d.expires_at DESC LIMIT 1""",
+                        (repo, action, now),
+                    ).fetchone()
+                    if deleg is not None:
+                        status = "approved_delegated"
+                        decided_by = str(deleg["approver"])
+                        decided_at = now
+                        receipt = self._sign_req_receipt(
+                            {
+                                "id": req_id, "repo": repo, "action": action,
+                                "target_path": target_path, "prev_sha256": prev_sha,
+                                "target_sha256": target_sha, "suite_seq": suite_seq,
+                            },
+                            decided_by=decided_by,
+                            delegation_id=str(deleg["id"]),
+                        )
+
+                c.execute(
+                    """INSERT INTO requests(
+                           id, display_id, repo, agent_id, action, target_path,
+                           prev_sha256, target_sha256, diff_summary, target_content,
+                           suite_seq, status, deny_reason, decided_by, receipt_json,
+                           created_at, decided_at
+                       ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (
+                        req_id, display_id, repo, agent_id, action, target_path,
+                        prev_sha, target_sha, diff_summary, target_content,
+                        suite_seq, status, "", decided_by,
+                        json.dumps(receipt) if receipt else None,
+                        now, decided_at,
+                    ),
+                )
+                c.execute("COMMIT")
+                row = c.execute("SELECT * FROM requests WHERE id=?", (req_id,)).fetchone()
+                return self._row_to_dict(row), (status == "pending")
+            except Exception:
+                c.execute("ROLLBACK")
+                raise
+
+    def get_request(self, key: str) -> dict[str, Any] | None:
+        c = self._conn()
+        row = c.execute("SELECT * FROM requests WHERE id=?", (key,)).fetchone()
+        if row is None:
+            row = c.execute(
+                "SELECT * FROM requests WHERE display_id=? ORDER BY created_at DESC LIMIT 1",
+                (key,),
+            ).fetchone()
+        return self._row_to_dict(row) if row is not None else None
+
+    def list_requests(self, allowed_repos: frozenset[str], status: str | None = None,
+                      limit: int = 200) -> list[dict[str, Any]]:
+        c = self._conn()
+        if "*" in allowed_repos:
+            if status:
+                rows = c.execute(
+                    "SELECT * FROM requests WHERE status=? ORDER BY created_at DESC LIMIT ?",
+                    (status, limit),
+                ).fetchall()
+            else:
+                rows = c.execute(
+                    "SELECT * FROM requests ORDER BY created_at DESC LIMIT ?",
+                    (limit,),
+                ).fetchall()
+            return [self._row_to_dict(r) for r in rows]
+        if not allowed_repos:
+            return []
+        placeholders = ",".join("?" for _ in allowed_repos)
+        params: list[Any] = sorted(allowed_repos)
+        if status:
+            params.extend([status, limit])
+            rows = c.execute(
+                f"SELECT * FROM requests WHERE repo IN ({placeholders}) AND status=? ORDER BY created_at DESC LIMIT ?",
+                params,
+            ).fetchall()
+        else:
+            params.append(limit)
+            rows = c.execute(
+                f"SELECT * FROM requests WHERE repo IN ({placeholders}) ORDER BY created_at DESC LIMIT ?",
+                params,
+            ).fetchall()
+        return [self._row_to_dict(r) for r in rows]
+
+    def decide_request(self, req_id: str, mode: str, *, approver: str,
+                       allowed_repos: frozenset[str], deny_reason: str = "") -> dict[str, Any] | None:
+        if mode not in ("single", "delegate_30m", "deny"):
+            raise ValueError(f"invalid decide mode: {mode!r}")
+        now = int(time.time())
+        with self._write_lock:
+            c = self._conn()
+            c.execute("BEGIN IMMEDIATE")
+            try:
+                row = c.execute("SELECT * FROM requests WHERE id=?", (req_id,)).fetchone()
+                if row is None:
+                    c.execute("COMMIT")
+                    return None
+                req = self._row_to_dict(row)
+                if not can_access_repo(allowed_repos, req["repo"]):
+                    raise ForbiddenError(f"approver {approver!r} cannot access {req['repo']!r}")
+                if req["action"] == "suite.release":
+                    if not is_suite_owner(allowed_repos, req["repo"]):
+                        raise ForbiddenError(f"approver {approver!r} is not suite owner for {req['repo']!r}")
+                    if mode == "delegate_30m":
+                        raise ForbiddenError("suite.release cannot create delegations")
+                if req["status"] != "pending":
+                    c.execute("COMMIT")
+                    return req
+
+                if mode == "deny":
+                    c.execute(
+                        "UPDATE requests SET status='denied', deny_reason=?, decided_by=?, decided_at=? WHERE id=?",
+                        (deny_reason.strip() or "denied by approver", approver, now, req_id),
+                    )
+                else:
+                    if req["action"] == "suite.release":
+                        seq = int(req.get("suite_seq") or 0)
+                        rel_row = c.execute(
+                            "SELECT last_seq FROM suite_releases WHERE upstream_repo=?",
+                            (req["repo"],),
+                        ).fetchone()
+                        if rel_row is not None and seq <= int(rel_row["last_seq"]):
+                            raise SuiteSeqConflictError(
+                                f"suite_seq {seq} <= last_released_seq {rel_row['last_seq']}"
+                            )
+                        c.execute(
+                            "INSERT OR REPLACE INTO suite_releases(upstream_repo, last_seq, tree_sha256, updated_at) VALUES(?,?,?,?)",
+                            (req["repo"], seq, req["target_sha256"], now),
+                        )
+                    deleg_id = None
+                    if mode == "delegate_30m":
+                        deleg_id = f"del-{uuid.uuid4().hex[:10]}"
+                        c.execute(
+                            "INSERT INTO delegations(id, repo, action, approver, expires_at, created_at) VALUES(?,?,?,?,?,?)",
+                            (deleg_id, req["repo"], req["action"], approver, now + 1800, now),
+                        )
+                    receipt = self._sign_req_receipt(req, decided_by=approver, delegation_id=deleg_id)
+                    c.execute(
+                        "UPDATE requests SET status='approved', decided_by=?, receipt_json=?, decided_at=? WHERE id=?",
+                        (approver, json.dumps(receipt), now, req_id),
+                    )
+                c.execute("COMMIT")
+                updated = c.execute("SELECT * FROM requests WHERE id=?", (req_id,)).fetchone()
+                return self._row_to_dict(updated)
+            except Exception:
+                c.execute("ROLLBACK")
+                raise
+
+    def list_delegations(self, allowed_repos: frozenset[str]) -> tuple[list[dict[str, Any]], list[str]]:
+        c = self._conn()
+        now = int(time.time())
+        rev_rows = c.execute("SELECT id FROM revocations ORDER BY id").fetchall()
+        rev = [str(r["id"]) for r in rev_rows]
+        if "*" in allowed_repos:
+            rows = c.execute("SELECT * FROM delegations WHERE expires_at > ? ORDER BY created_at DESC", (now,)).fetchall()
+            return [dict(r) for r in rows], rev
+        if not allowed_repos:
+            return [], rev
+        placeholders = ",".join("?" for _ in allowed_repos)
+        rows = c.execute(
+            f"SELECT * FROM delegations WHERE repo IN ({placeholders}) AND expires_at > ? ORDER BY created_at DESC",
+            [*sorted(allowed_repos), now],
+        ).fetchall()
+        return [dict(r) for r in rows], rev
+
+    def revoke_id(self, target_id: str, *, allowed_repos: frozenset[str]) -> bool:
+        now = int(time.time())
+        with self._write_lock:
+            c = self._conn()
+            row = c.execute("SELECT repo FROM delegations WHERE id=?", (target_id,)).fetchone()
+            if row is not None and not can_access_repo(allowed_repos, str(row["repo"])):
+                raise ForbiddenError("cannot revoke delegation for another repo")
+            if row is None and "*" not in allowed_repos:
+                raise ForbiddenError("only wildcard owner can revoke arbitrary id")
+            c.execute("INSERT OR IGNORE INTO revocations(id, revoked_at) VALUES(?,?)", (target_id, now))
+        return True
+
+    def list_revocations(self) -> list[str]:
+        rows = self._conn().execute("SELECT id FROM revocations ORDER BY id").fetchall()
+        return [str(r["id"]) for r in rows]
