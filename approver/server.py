@@ -5,6 +5,7 @@ import html
 import http.cookies
 import http.server
 import json
+import ssl
 import urllib.parse
 from typing import Any
 
@@ -178,7 +179,8 @@ def _render_dashboard(store: ApproverStore, allowed_repos: frozenset[str], appro
     )
 
 
-def make_handler(store: ApproverStore, dispatcher: RepoWebhookDispatcher) -> type[http.server.BaseHTTPRequestHandler]:
+def make_handler(store: ApproverStore, dispatcher: RepoWebhookDispatcher,
+                 *, is_tls: bool = False) -> type[http.server.BaseHTTPRequestHandler]:
     class Handler(http.server.BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
 
@@ -339,14 +341,16 @@ def make_handler(store: ApproverStore, dispatcher: RepoWebhookDispatcher) -> typ
                         self._html(401, _render_login("Invalid passphrase"))
                         return
                     tok = store.create_session(tok_ident[0], frozenset())
-                self._redirect("/", cookie=f"approver_sess={tok}; HttpOnly; SameSite=Lax; Path=/")
+                sec = "; Secure" if is_tls else ""
+                self._redirect("/", cookie=f"approver_sess={tok}; HttpOnly; SameSite=Lax; Path=/{sec}")
                 return
 
             if path == "/logout":
                 sess_tok = self._session_id()
                 if sess_tok:
                     store.delete_session(sess_tok)
-                self._redirect("/", cookie="approver_sess=; Max-Age=0; Path=/")
+                sec = "; Secure" if is_tls else ""
+                self._redirect("/", cookie=f"approver_sess=; Max-Age=0; Path=/{sec}")
                 return
 
             if path in ("/api/keychain/bind", "/keychain"):
@@ -446,7 +450,37 @@ def make_handler(store: ApproverStore, dispatcher: RepoWebhookDispatcher) -> typ
     return Handler
 
 
+class _TLSThreadingHTTPServer(http.server.ThreadingHTTPServer):
+    """ThreadingHTTPServer that performs TLS handshakes inside worker threads."""
+
+    allow_reuse_address = True
+    daemon_threads = True
+
+    def __init__(self, server_address: tuple[str, int],
+                 request_handler_class: type[http.server.BaseHTTPRequestHandler],
+                 ssl_context: ssl.SSLContext) -> None:
+        self.ssl_context = ssl_context
+        super().__init__(server_address, request_handler_class)
+
+    def process_request_thread(self, request: Any, client_address: Any) -> None:
+        try:
+            request.settimeout(10.0)
+            tls_sock = self.ssl_context.wrap_socket(request, server_side=True)
+            tls_sock.settimeout(None)
+        except (ssl.SSLError, OSError):
+            try:
+                request.close()
+            except OSError:
+                pass
+            return
+        super().process_request_thread(tls_sock, client_address)
+
+
 def create_server(host: str, port: int, store: ApproverStore,
-                  dispatcher: RepoWebhookDispatcher) -> http.server.ThreadingHTTPServer:
-    """Create a `ThreadingHTTPServer` bound to `(host, port)`."""
-    return http.server.ThreadingHTTPServer((host, port), make_handler(store, dispatcher))
+                  dispatcher: RepoWebhookDispatcher,
+                  ssl_context: ssl.SSLContext | None = None) -> http.server.ThreadingHTTPServer:
+    """Create a `ThreadingHTTPServer` bound to `(host, port)` (HTTPS when `ssl_context` is given)."""
+    handler = make_handler(store, dispatcher, is_tls=ssl_context is not None)
+    if ssl_context is not None:
+        return _TLSThreadingHTTPServer((host, port), handler, ssl_context)
+    return http.server.ThreadingHTTPServer((host, port), handler)

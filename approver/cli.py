@@ -3,7 +3,9 @@ from __future__ import annotations
 
 import argparse
 import os
+import ssl
 import sys
+import threading
 from pathlib import Path
 
 from . import crypto
@@ -16,6 +18,10 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Einfacht Approver v2 Control Plane")
     parser.add_argument("--host", default=os.environ.get("APPROVER_HOST", "127.0.0.1"))
     parser.add_argument("--port", type=int, default=int(os.environ.get("APPROVER_PORT", "18443")))
+    parser.add_argument("--tls-host", default=os.environ.get("APPROVER_TLS_HOST", "0.0.0.0"))
+    parser.add_argument("--tls-port", type=int, default=int(os.environ.get("APPROVER_TLS_PORT", "0")))
+    parser.add_argument("--tls-cert", default=os.environ.get("APPROVER_TLS_CERT", "/etc/einfacht-approver/tls.crt"))
+    parser.add_argument("--tls-key", default=os.environ.get("APPROVER_TLS_KEY", "/etc/einfacht-approver/tls.key"))
     parser.add_argument("--state-dir", default=os.environ.get("APPROVER_STATE_DIR", "/var/lib/einfacht-approver"))
     parser.add_argument("--pass-file", default=os.environ.get("APPROVER_PASS_FILE", "/etc/einfacht-approver/admin.pass"))
     parser.add_argument("--webhook-file", default=os.environ.get("APPROVER_WEBHOOK_FILE", "/etc/einfacht-approver/webhook.url"))
@@ -61,11 +67,26 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     dispatcher = RepoWebhookDispatcher(Path(args.webhook_file), Path(args.decision_webhook_file))
     srv = create_server(args.host, args.port, store, dispatcher)
+    tls_srv = None
+    if args.tls_port > 0:
+        cert_p, key_p = Path(args.tls_cert), Path(args.tls_key)
+        if not cert_p.is_file() or not key_p.is_file():
+            srv.server_close()
+            store.close()
+            raise SystemExit(f"missing TLS cert/key: {cert_p} / {key_p}")
+        ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ssl_ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+        ssl_ctx.load_cert_chain(certfile=str(cert_p), keyfile=str(key_p))
+        tls_srv = create_server(args.tls_host, args.tls_port, store, dispatcher, ssl_context=ssl_ctx)
+        threading.Thread(target=tls_srv.serve_forever, name="approver-tls", daemon=True).start()
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
         pass
     finally:
+        if tls_srv is not None:
+            tls_srv.shutdown()
+            tls_srv.server_close()
         dispatcher.flush_all()
         srv.server_close()
     return 0
