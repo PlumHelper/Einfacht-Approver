@@ -427,6 +427,54 @@ def make_handler(store: ApproverStore, dispatcher: RepoWebhookDispatcher,
                     self._json(200, updated)
                 return
 
+            if path == "/api/decide-batch":
+                ident = self._current_identity()
+                if not ident:
+                    self._json(403, {"error": "forbidden"})
+                    return
+                data = self._parse_json_or_form(raw)
+                decisions = data.get("decisions")
+                if not isinstance(decisions, list):
+                    self._json(400, {"error": "bad_request", "detail": "decisions must be a list"})
+                    return
+                try:
+                    results = store.decide_batch(decisions, approver=ident[0], allowed_repos=ident[1])
+                except ValueError as exc:
+                    self._json(400, {"error": "bad_request", "detail": str(exc)})
+                    return
+                except ForbiddenError as exc:
+                    self._json(403, {"error": "forbidden", "detail": str(exc)})
+                    return
+                except SuiteSeqConflictError as exc:
+                    self._json(409, {"error": "suite_seq_conflict", "detail": str(exc)})
+                    return
+                except KeyError:
+                    self._json(404, {"error": "not_found"})
+                    return
+                for item in results:
+                    dispatcher.notify_decision(item)
+                self._json(200, {"results": results})
+                return
+
+            if path == "/api/withdraw":
+                ident = self._current_identity()
+                if not ident:
+                    self._json(403, {"error": "forbidden"})
+                    return
+                data = self._parse_json_or_form(raw)
+                req_id = str(data.get("req_id") or "").strip()
+                reason = str(data.get("reason") or "")
+                try:
+                    updated = store.withdraw_request(req_id, actor=ident[0], allowed_repos=ident[1], reason=reason)
+                except ForbiddenError as exc:
+                    self._json(403, {"error": "forbidden", "detail": str(exc)})
+                    return
+                if updated is None:
+                    self._json(404, {"error": "not_found"})
+                    return
+                self._json(200, updated)
+                return
+
             if path in ("/api/revoke", "/revoke"):
                 ident = self._current_identity()
                 if not ident:

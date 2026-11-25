@@ -474,6 +474,22 @@ class ApproverStore:
                         now, decided_at,
                     ),
                 )
+                sup_reason = f"superseded by {display_id}"
+                if action == "suite.release":
+                    c.execute(
+                        """UPDATE requests
+                           SET status='superseded', deny_reason=?, decided_by='system:supersede', decided_at=?
+                           WHERE repo=? AND action='suite.release' AND status='pending'
+                             AND COALESCE(suite_seq, 0) < ? AND id != ?""",
+                        (sup_reason, now, repo, int(suite_seq or 0), req_id),
+                    )
+                else:
+                    c.execute(
+                        """UPDATE requests
+                           SET status='superseded', deny_reason=?, decided_by='system:supersede', decided_at=?
+                           WHERE repo=? AND action=? AND target_path=? AND status='pending' AND id != ?""",
+                        (sup_reason, now, repo, action, target_path, req_id),
+                    )
                 c.execute("COMMIT")
                 row = c.execute("SELECT * FROM requests WHERE id=?", (req_id,)).fetchone()
                 return self._row_to_dict(row), (status == "pending")
@@ -524,10 +540,109 @@ class ApproverStore:
             ).fetchall()
         return [self._row_to_dict(r) for r in rows]
 
+    def _decide_one_in_tx(self, c: sqlite3.Connection, req_id: str, mode: str, *, approver: str,
+                          allowed_repos: frozenset[str], deny_reason: str, now: int) -> dict[str, Any] | None:
+        if mode not in ("single", "delegate_30m", "deny"):
+            raise ValueError(f"invalid decide mode: {mode!r}")
+        row = c.execute("SELECT * FROM requests WHERE id=?", (req_id,)).fetchone()
+        if row is None:
+            return None
+        req = self._row_to_dict(row)
+        if not can_access_repo(allowed_repos, req["repo"]):
+            raise ForbiddenError(f"approver {approver!r} cannot access {req['repo']!r}")
+        if req["action"] == "suite.release":
+            if not is_suite_owner(allowed_repos, req["repo"]):
+                raise ForbiddenError(f"approver {approver!r} is not suite owner for {req['repo']!r}")
+            if mode == "delegate_30m":
+                raise ForbiddenError("suite.release cannot create delegations")
+        if req["status"] != "pending":
+            return req
+
+        if mode == "deny":
+            c.execute(
+                "UPDATE requests SET status='denied', deny_reason=?, decided_by=?, decided_at=? WHERE id=?",
+                (deny_reason.strip() or "denied by approver", approver, now, req_id),
+            )
+        else:
+            if req["action"] == "suite.release":
+                seq = int(req.get("suite_seq") or 0)
+                rel_row = c.execute(
+                    "SELECT last_seq FROM suite_releases WHERE upstream_repo=?",
+                    (req["repo"],),
+                ).fetchone()
+                if rel_row is not None and seq <= int(rel_row["last_seq"]):
+                    raise SuiteSeqConflictError(
+                        f"suite_seq {seq} <= last_released_seq {rel_row['last_seq']}"
+                    )
+                c.execute(
+                    "INSERT OR REPLACE INTO suite_releases(upstream_repo, last_seq, tree_sha256, updated_at) VALUES(?,?,?,?)",
+                    (req["repo"], seq, req["target_sha256"], now),
+                )
+            deleg_id = None
+            if mode == "delegate_30m":
+                deleg_id = f"del-{uuid.uuid4().hex[:10]}"
+                c.execute(
+                    "INSERT INTO delegations(id, repo, action, approver, expires_at, created_at) VALUES(?,?,?,?,?,?)",
+                    (deleg_id, req["repo"], req["action"], approver, now + 1800, now),
+                )
+            receipt = self._sign_req_receipt(req, decided_by=approver, delegation_id=deleg_id)
+            c.execute(
+                "UPDATE requests SET status='approved', decided_by=?, receipt_json=?, decided_at=? WHERE id=?",
+                (approver, json.dumps(receipt), now, req_id),
+            )
+        updated = c.execute("SELECT * FROM requests WHERE id=?", (req_id,)).fetchone()
+        return self._row_to_dict(updated)
+
     def decide_request(self, req_id: str, mode: str, *, approver: str,
                        allowed_repos: frozenset[str], deny_reason: str = "") -> dict[str, Any] | None:
         if mode not in ("single", "delegate_30m", "deny"):
             raise ValueError(f"invalid decide mode: {mode!r}")
+        now = int(time.time())
+        with self._write_lock:
+            c = self._conn()
+            c.execute("BEGIN IMMEDIATE")
+            try:
+                res = self._decide_one_in_tx(
+                    c, req_id, mode, approver=approver,
+                    allowed_repos=allowed_repos, deny_reason=deny_reason, now=now,
+                )
+                c.execute("COMMIT")
+                return res
+            except Exception:
+                c.execute("ROLLBACK")
+                raise
+
+    def decide_batch(self, decisions: list[dict[str, Any]], *, approver: str,
+                     allowed_repos: frozenset[str]) -> list[dict[str, Any]]:
+        if not isinstance(decisions, list) or not decisions:
+            raise ValueError("decisions must be a non-empty list")
+        now = int(time.time())
+        with self._write_lock:
+            c = self._conn()
+            c.execute("BEGIN IMMEDIATE")
+            try:
+                out: list[dict[str, Any]] = []
+                for item in decisions:
+                    if not isinstance(item, dict) or not str(item.get("req_id") or "").strip():
+                        raise ValueError("each decision requires non-empty req_id")
+                    req_id = str(item["req_id"]).strip()
+                    mode = str(item.get("mode") or "single")
+                    reason = str(item.get("deny_reason") or "")
+                    res = self._decide_one_in_tx(
+                        c, req_id, mode, approver=approver,
+                        allowed_repos=allowed_repos, deny_reason=reason, now=now,
+                    )
+                    if res is None:
+                        raise KeyError(req_id)
+                    out.append(res)
+                c.execute("COMMIT")
+                return out
+            except Exception:
+                c.execute("ROLLBACK")
+                raise
+
+    def withdraw_request(self, req_id: str, *, actor: str, allowed_repos: frozenset[str],
+                         reason: str = "") -> dict[str, Any] | None:
         now = int(time.time())
         with self._write_lock:
             c = self._conn()
@@ -539,48 +654,14 @@ class ApproverStore:
                     return None
                 req = self._row_to_dict(row)
                 if not can_access_repo(allowed_repos, req["repo"]):
-                    raise ForbiddenError(f"approver {approver!r} cannot access {req['repo']!r}")
-                if req["action"] == "suite.release":
-                    if not is_suite_owner(allowed_repos, req["repo"]):
-                        raise ForbiddenError(f"approver {approver!r} is not suite owner for {req['repo']!r}")
-                    if mode == "delegate_30m":
-                        raise ForbiddenError("suite.release cannot create delegations")
+                    raise ForbiddenError(f"actor {actor!r} cannot withdraw {req['repo']!r}")
                 if req["status"] != "pending":
                     c.execute("COMMIT")
                     return req
-
-                if mode == "deny":
-                    c.execute(
-                        "UPDATE requests SET status='denied', deny_reason=?, decided_by=?, decided_at=? WHERE id=?",
-                        (deny_reason.strip() or "denied by approver", approver, now, req_id),
-                    )
-                else:
-                    if req["action"] == "suite.release":
-                        seq = int(req.get("suite_seq") or 0)
-                        rel_row = c.execute(
-                            "SELECT last_seq FROM suite_releases WHERE upstream_repo=?",
-                            (req["repo"],),
-                        ).fetchone()
-                        if rel_row is not None and seq <= int(rel_row["last_seq"]):
-                            raise SuiteSeqConflictError(
-                                f"suite_seq {seq} <= last_released_seq {rel_row['last_seq']}"
-                            )
-                        c.execute(
-                            "INSERT OR REPLACE INTO suite_releases(upstream_repo, last_seq, tree_sha256, updated_at) VALUES(?,?,?,?)",
-                            (req["repo"], seq, req["target_sha256"], now),
-                        )
-                    deleg_id = None
-                    if mode == "delegate_30m":
-                        deleg_id = f"del-{uuid.uuid4().hex[:10]}"
-                        c.execute(
-                            "INSERT INTO delegations(id, repo, action, approver, expires_at, created_at) VALUES(?,?,?,?,?,?)",
-                            (deleg_id, req["repo"], req["action"], approver, now + 1800, now),
-                        )
-                    receipt = self._sign_req_receipt(req, decided_by=approver, delegation_id=deleg_id)
-                    c.execute(
-                        "UPDATE requests SET status='approved', decided_by=?, receipt_json=?, decided_at=? WHERE id=?",
-                        (approver, json.dumps(receipt), now, req_id),
-                    )
+                c.execute(
+                    "UPDATE requests SET status='withdrawn', deny_reason=?, decided_by=?, decided_at=? WHERE id=?",
+                    (reason.strip() or "withdrawn by submitter", actor, now, req_id),
+                )
                 c.execute("COMMIT")
                 updated = c.execute("SELECT * FROM requests WHERE id=?", (req_id,)).fetchone()
                 return self._row_to_dict(updated)
