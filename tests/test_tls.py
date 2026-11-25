@@ -21,7 +21,6 @@ from cryptography.x509.oid import NameOID
 from approver.crypto import hash_passphrase
 from approver.server import create_server
 from approver.store import ApproverStore
-from approver.webhooks import RepoWebhookDispatcher
 
 
 def _write_self_signed_cert(cert_path: Path, key_path: Path) -> None:
@@ -70,13 +69,12 @@ class TLSListenerTests(unittest.TestCase):
             _write_self_signed_cert(cert_p, key_p)
 
             store = ApproverStore(root / "state", pass_file)
-            dispatcher = RepoWebhookDispatcher(root / "wh.url", root / "dwh.url")
 
-            http_srv = create_server("127.0.0.1", 0, store, dispatcher)
+            http_srv = create_server("127.0.0.1", 0, store)
             ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
             ssl_ctx.minimum_version = ssl.TLSVersion.TLSv1_2
             ssl_ctx.load_cert_chain(certfile=str(cert_p), keyfile=str(key_p))
-            https_srv = create_server("127.0.0.1", 0, store, dispatcher, ssl_context=ssl_ctx)
+            https_srv = create_server("127.0.0.1", 0, store, ssl_context=ssl_ctx)
 
             t_http = threading.Thread(target=http_srv.serve_forever, daemon=True)
             t_https = threading.Thread(target=https_srv.serve_forever, daemon=True)
@@ -121,7 +119,6 @@ class TLSListenerTests(unittest.TestCase):
                 https_srv.server_close()
                 http_srv.shutdown()
                 http_srv.server_close()
-                dispatcher.flush_all()
                 store.close()
 
 

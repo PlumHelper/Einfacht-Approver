@@ -11,7 +11,6 @@ from pathlib import Path
 from . import crypto
 from .server import create_server
 from .store import ApproverStore
-from .webhooks import RepoWebhookDispatcher
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -65,8 +64,7 @@ def main(argv: list[str] | None = None) -> int:
         store.close()
         print(tok)
         return 0
-    dispatcher = RepoWebhookDispatcher(Path(args.webhook_file), Path(args.decision_webhook_file))
-    srv = create_server(args.host, args.port, store, dispatcher)
+    srv = create_server(args.host, args.port, store)
     tls_srv = None
     if args.tls_port > 0:
         cert_p, key_p = Path(args.tls_cert), Path(args.tls_key)
@@ -77,7 +75,7 @@ def main(argv: list[str] | None = None) -> int:
         ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         ssl_ctx.minimum_version = ssl.TLSVersion.TLSv1_2
         ssl_ctx.load_cert_chain(certfile=str(cert_p), keyfile=str(key_p))
-        tls_srv = create_server(args.tls_host, args.tls_port, store, dispatcher, ssl_context=ssl_ctx)
+        tls_srv = create_server(args.tls_host, args.tls_port, store, ssl_context=ssl_ctx)
         threading.Thread(target=tls_srv.serve_forever, name="approver-tls", daemon=True).start()
     try:
         srv.serve_forever()
@@ -87,6 +85,5 @@ def main(argv: list[str] | None = None) -> int:
         if tls_srv is not None:
             tls_srv.shutdown()
             tls_srv.server_close()
-        dispatcher.flush_all()
         srv.server_close()
     return 0

@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import concurrent.futures
-import http.server
 import json
 import os
 import sys
@@ -17,7 +16,6 @@ from pathlib import Path
 from approver import crypto
 from approver.server import create_server
 from approver.store import ApproverStore, ForbiddenError
-from approver.webhooks import RepoWebhookDispatcher
 
 
 def _find_einfacht_zreflect() -> Path:
@@ -49,46 +47,11 @@ def _http(url: str, *, method: str = "GET", body: dict | None = None,
         return err.code, json.loads(err.read().decode("utf-8"))
 
 
-class _WebhookSink:
-    """Thread-safe mock HTTP server recording per-repo webhook payloads by path."""
-
-    def __init__(self) -> None:
-        self.lock = threading.Lock()
-        self.events: dict[str, list[dict]] = {}
-        sink = self
-
-        class H(http.server.BaseHTTPRequestHandler):
-            def log_message(self, fmt, *args):
-                return
-
-            def do_POST(self):
-                n = int(self.headers.get("Content-Length", "0") or 0)
-                payload = json.loads(self.rfile.read(n).decode("utf-8"))
-                with sink.lock:
-                    sink.events.setdefault(self.path, []).append(payload)
-                self.send_response(200)
-                self.send_header("Content-Length", "2")
-                self.end_headers()
-                self.wfile.write(b"ok")
-
-        self.srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
-        self.port = self.srv.server_address[1]
-        self.thread = threading.Thread(target=self.srv.serve_forever, daemon=True)
-        self.thread.start()
-
-    def close(self) -> None:
-        self.srv.shutdown()
-        self.srv.server_close()
-
-
 class FleetStressTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
         root = Path(self.tmp.name)
         self.pass_file = root / "admin.pass"
-        self.wh_file = root / "webhook.url"
-        self.dec_wh_file = root / "decision-webhook.url"
-        self.sink = _WebhookSink()
 
         repos = [f"org/repo-{i:02d}" for i in range(1, 17)]
         self.repos = repos
@@ -105,34 +68,20 @@ class FleetStressTests(unittest.TestCase):
         ]
         self.pass_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
-        wh_lines = [
-            f"{repo} http://127.0.0.1:{self.sink.port}/req/{repo.replace('/', '_')}"
-            for repo in repos
-        ]
-        dec_lines = [
-            f"{repo} http://127.0.0.1:{self.sink.port}/dec/{repo.replace('/', '_')}"
-            for repo in repos
-        ]
-        self.wh_file.write_text("\n".join(wh_lines) + "\n", encoding="utf-8")
-        self.dec_wh_file.write_text("\n".join(dec_lines) + "\n", encoding="utf-8")
-
         self.store = ApproverStore(root / "state", self.pass_file)
         # Bind slices into each approver's keychain in one batch per approver
         self.store.bind_keychain_many("shard_a", repos[0:5])
         self.store.bind_keychain_many("shard_b", repos[5:10])
         self.store.bind_keychain_many("shard_c", repos[10:15])
-        self.dispatcher = RepoWebhookDispatcher(self.wh_file, self.dec_wh_file, debounce_sec=0.05)
-        self.srv = create_server("127.0.0.1", 0, self.store, self.dispatcher)
+        self.srv = create_server("127.0.0.1", 0, self.store)
         self.base_url = f"http://127.0.0.1:{self.srv.server_address[1]}"
         self.srv_thread = threading.Thread(target=self.srv.serve_forever, daemon=True)
         self.srv_thread.start()
 
     def tearDown(self) -> None:
-        self.dispatcher.flush_all()
         self.srv.shutdown()
         self.srv.server_close()
         self.store.close()
-        self.sink.close()
         self.tmp.cleanup()
 
     def test_01_login_page_renders_200(self) -> None:
@@ -141,7 +90,7 @@ class FleetStressTests(unittest.TestCase):
             html_body = r.read().decode("utf-8")
             self.assertIn("Einfacht Isolated Approver v2", html_body)
 
-    def test_02_16_repo_concurrent_webhooks_zero_crosstalk(self) -> None:
+    def test_02_16_repo_concurrent_requests_zero_crosstalk(self) -> None:
         def submit_one(idx: int) -> tuple[int, dict]:
             repo = self.repos[idx % 16]
             return _http(self.base_url + "/requests", method="POST", body={
@@ -159,7 +108,6 @@ class FleetStressTests(unittest.TestCase):
         self.assertTrue(all(code in (200, 201) for code, _ in results))
         req_ids = [(r["repo"], r["id"]) for _, r in results]
 
-        # Approve all 80 concurrently as owner
         with concurrent.futures.ThreadPoolExecutor(max_workers=16) as pool:
             dec_results = list(pool.map(
                 lambda item: _http(
@@ -169,21 +117,13 @@ class FleetStressTests(unittest.TestCase):
                 ),
                 req_ids,
             ))
-        self.assertTrue(all(code == 200 for code, _ in dec_results))
-        time.sleep(0.25)
-        self.dispatcher.flush_all()
+        self.assertTrue(all(code == 200 and body["status"] == "approved" for code, body in dec_results))
 
-        with self.sink.lock:
-            for repo in self.repos:
-                slug = repo.replace("/", "_")
-                req_events = self.sink.events.get(f"/req/{slug}", [])
-                dec_events = self.sink.events.get(f"/dec/{slug}", [])
-                self.assertTrue(req_events, f"missing req webhook for {repo}")
-                self.assertTrue(dec_events, f"missing dec webhook for {repo}")
-                self.assertTrue(all(ev["repo"] == repo for ev in req_events))
-                self.assertTrue(all(ev["repo"] == repo for ev in dec_events))
-                self.assertEqual(sum(ev["count"] for ev in req_events), 5)
-                self.assertEqual(sum(ev["count"] for ev in dec_events), 5)
+        for repo in self.repos:
+            code, rec_resp = _http(self.base_url + f"/receipts?repo={repo}")
+            self.assertEqual(code, 200)
+            self.assertEqual(len(rec_resp["receipts"]), 5)
+            self.assertTrue(all(rec["repo"] == repo for rec in rec_resp["receipts"]))
 
     def test_03_rbac_cross_repo_and_suite_release_forbidden(self) -> None:
         _, r1 = _http(self.base_url + "/requests", method="POST", body={
@@ -418,8 +358,7 @@ class FleetStressTests(unittest.TestCase):
             tid = f"tid-bot-{b + 1}"
             tok = self.store.issue_thread_token(tid)
             assigned = [self.repos[i] for i in range(b * 3, min(16, (b + 1) * 3 + (1 if b == 4 else 0)))]
-            for r in assigned:
-                self.store.bind_keychain(tid, r)
+            self.store.bind_keychain_many(tid, assigned)
             bots[tid] = (tok, assigned)
 
         req_by_repo: dict[str, list[str]] = {}

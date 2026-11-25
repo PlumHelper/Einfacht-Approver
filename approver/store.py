@@ -107,11 +107,6 @@ def can_access_repo(allowed_repos: frozenset[str], repo: str) -> bool:
     return "*" in allowed_repos or repo in allowed_repos
 
 
-def is_suite_owner(allowed_repos: frozenset[str], upstream_repo: str) -> bool:
-    """True iff approver has explicit ownership of `upstream_repo` or wildcard `*`."""
-    return "*" in allowed_repos or upstream_repo in allowed_repos
-
-
 class SuiteSeqConflictError(Exception):
     """Raised when a concurrent `suite.release` collides with or regresses `last_seq`."""
 
@@ -196,15 +191,8 @@ class ApproverStore:
                     self._conns.remove(conn)
             self._local.conn = None
 
-    def pub_pem(self) -> str:
-        return self.pub_pem_str
-
     def key_info(self) -> tuple[str, str]:
         return self.pub_pem_str, self.key_id
-
-    def bind_keychain(self, approver: str, repo: str) -> None:
-        """Bind `repo` to `approver`'s keychain."""
-        self.bind_keychain_many(approver, [repo])
 
     def bind_keychain_many(self, approver: str, repos: list[str] | tuple[str, ...]) -> list[str]:
         """Bind multiple `repos` to `approver`'s keychain in one transaction."""
@@ -386,68 +374,38 @@ class ApproverStore:
         if raw_seq is not None:
             if isinstance(raw_seq, bool):
                 raise ValueError("invalid suite_seq")
-            suite_seq = int(raw_seq)
+            suite_seq: int | None = int(raw_seq)
         else:
             suite_seq = None
         now = int(time.time())
+        key_fields = {
+            "repo": repo, "action": action, "target_path": target_path,
+            "prev": prev_sha, "target": target_sha,
+        }
 
         with self._tx() as c:
-            existing = c.execute(
-                """SELECT * FROM requests
-                   WHERE repo=? AND action=? AND target_path=? AND prev_sha256=? AND target_sha256=?
-                     AND COALESCE(suite_seq, -1) = COALESCE(?, -1)
-                   ORDER BY created_at DESC, rowid DESC LIMIT 1""",
-                (repo, action, target_path, prev_sha, target_sha, suite_seq),
-            ).fetchone()
-            if existing is not None:
-                ex = self._row_to_dict(existing)
-                if ex["status"] == "denied":
-                    return {
-                        **ex,
-                        "status": "rejected_duplicate",
-                        "original_id": ex["id"],
-                    }, False
-                if ex["status"] == "pending":
-                    return ex, False
-                if ex["status"] in ("approved", "approved_delegated"):
-                    ex_rec = ex.get("receipt") or {}
-                    rec_exp = int(ex_rec.get("expires_at") or 0)
-                    is_rev = c.execute(
-                        "SELECT 1 FROM revocations WHERE id IN (?,?)",
-                        (str(ex_rec.get("id") or ""), str(ex_rec.get("delegation_id") or "")),
-                    ).fetchone() is not None
-                    if not is_rev and rec_exp > now:
-                        return ex, False
+            reused = self._reuse_existing_in_tx(c, key_fields, suite_seq, now)
+            if reused is not None:
+                return reused
 
             if action == "suite.release":
                 if suite_seq is None or suite_seq <= 0:
                     raise SuiteSeqConflictError("suite_seq must be a positive integer")
                 rel_row = c.execute(
-                    "SELECT last_seq FROM suite_releases WHERE upstream_repo=?",
-                    (repo,),
+                    "SELECT last_seq FROM suite_releases WHERE upstream_repo=?", (repo,),
                 ).fetchone()
                 if rel_row is not None and suite_seq <= int(rel_row["last_seq"]):
                     raise SuiteSeqConflictError(
                         f"suite_seq {suite_seq} <= last_released_seq {rel_row['last_seq']}"
                     )
 
-            cnt_row = c.execute(
-                "SELECT last_seq FROM repo_counters WHERE repo=?",
-                (repo,),
-            ).fetchone()
+            cnt_row = c.execute("SELECT last_seq FROM repo_counters WHERE repo=?", (repo,)).fetchone()
             next_num = (int(cnt_row["last_seq"]) if cnt_row else 0) + 1
-            c.execute(
-                "INSERT OR REPLACE INTO repo_counters(repo, last_seq) VALUES(?,?)",
-                (repo, next_num),
-            )
+            c.execute("INSERT OR REPLACE INTO repo_counters(repo, last_seq) VALUES(?,?)", (repo, next_num))
             req_id = f"req-{uuid.uuid4().hex[:12]}"
             display_id = f"{repo}#{next_num}"
 
-            status = "pending"
-            decided_by = ""
-            decided_at = None
-            receipt = None
-
+            status, decided_by, decided_at, receipt = "pending", "", None, None
             if action != "suite.release":
                 deleg = c.execute(
                     """SELECT d.* FROM delegations d
@@ -457,17 +415,11 @@ class ApproverStore:
                     (repo, action, now),
                 ).fetchone()
                 if deleg is not None:
-                    status = "approved_delegated"
-                    decided_by = str(deleg["approver"])
-                    decided_at = now
+                    status, decided_by, decided_at = "approved_delegated", str(deleg["approver"]), now
                     receipt = self._sign_req_receipt(
-                        {
-                            "id": req_id, "repo": repo, "action": action,
-                            "target_path": target_path, "prev_sha256": prev_sha,
-                            "target_sha256": target_sha, "suite_seq": suite_seq,
-                        },
-                        decided_by=decided_by,
-                        delegation_id=str(deleg["id"]),
+                        {"id": req_id, "repo": repo, "action": action, "target_path": target_path,
+                         "prev_sha256": prev_sha, "target_sha256": target_sha, "suite_seq": suite_seq},
+                        decided_by=decided_by, delegation_id=str(deleg["id"]),
                     )
 
             c.execute(
@@ -477,32 +429,64 @@ class ApproverStore:
                        suite_seq, status, deny_reason, decided_by, receipt_json,
                        created_at, decided_at
                    ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (
-                    req_id, display_id, repo, agent_id, action, target_path,
-                    prev_sha, target_sha, diff_summary, target_content,
-                    suite_seq, status, "", decided_by,
-                    json.dumps(receipt) if receipt else None,
-                    now, decided_at,
-                ),
+                (req_id, display_id, repo, agent_id, action, target_path,
+                 prev_sha, target_sha, diff_summary, target_content,
+                 suite_seq, status, "", decided_by,
+                 json.dumps(receipt) if receipt else None, now, decided_at),
             )
-            sup_reason = f"superseded by {display_id}"
-            if action == "suite.release":
-                c.execute(
-                    """UPDATE requests
-                       SET status='superseded', deny_reason=?, decided_by='system:supersede', decided_at=?
-                       WHERE repo=? AND action='suite.release' AND status='pending'
-                         AND COALESCE(suite_seq, 0) < ? AND id != ?""",
-                    (sup_reason, now, repo, int(suite_seq or 0), req_id),
-                )
-            else:
-                c.execute(
-                    """UPDATE requests
-                       SET status='superseded', deny_reason=?, decided_by='system:supersede', decided_at=?
-                       WHERE repo=? AND action=? AND target_path=? AND status='pending' AND id != ?""",
-                    (sup_reason, now, repo, action, target_path, req_id),
-                )
+            self._supersede_pending_in_tx(
+                c, repo=repo, action=action, target_path=target_path,
+                suite_seq=suite_seq, req_id=req_id, display_id=display_id, now=now,
+            )
             row = c.execute("SELECT * FROM requests WHERE id=?", (req_id,)).fetchone()
             return self._row_to_dict(row), (status == "pending")
+
+    def _reuse_existing_in_tx(self, c: sqlite3.Connection, body: dict[str, str],
+                              suite_seq: int | None, now: int) -> tuple[dict[str, Any], bool] | None:
+        existing = c.execute(
+            """SELECT * FROM requests
+               WHERE repo=? AND action=? AND target_path=? AND prev_sha256=? AND target_sha256=?
+                 AND COALESCE(suite_seq, -1) = COALESCE(?, -1)
+               ORDER BY created_at DESC, rowid DESC LIMIT 1""",
+            (body["repo"], body["action"], body["target_path"], body["prev"], body["target"], suite_seq),
+        ).fetchone()
+        if existing is None:
+            return None
+        ex = self._row_to_dict(existing)
+        if ex["status"] == "denied":
+            return {**ex, "status": "rejected_duplicate", "original_id": ex["id"]}, False
+        if ex["status"] == "pending":
+            return ex, False
+        if ex["status"] in ("approved", "approved_delegated"):
+            ex_rec = ex.get("receipt") or {}
+            exp_ts = self._parse_exp_ts(ex_rec.get("expires_at"))
+            is_rev = c.execute(
+                "SELECT 1 FROM revocations WHERE id IN (?,?)",
+                (str(ex_rec.get("id") or ""), str(ex_rec.get("delegation_id") or "")),
+            ).fetchone() is not None
+            if not is_rev and exp_ts is not None and exp_ts > now:
+                return ex, False
+        return None
+
+    def _supersede_pending_in_tx(self, c: sqlite3.Connection, *, repo: str, action: str,
+                                 target_path: str, suite_seq: int | None, req_id: str,
+                                 display_id: str, now: int) -> None:
+        sup_reason = f"superseded by {display_id}"
+        if action == "suite.release":
+            c.execute(
+                """UPDATE requests
+                   SET status='superseded', deny_reason=?, decided_by='system:supersede', decided_at=?
+                   WHERE repo=? AND action='suite.release' AND status='pending'
+                     AND COALESCE(suite_seq, 0) < ? AND id != ?""",
+                (sup_reason, now, repo, int(suite_seq or 0), req_id),
+            )
+            return
+        c.execute(
+            """UPDATE requests
+               SET status='superseded', deny_reason=?, decided_by='system:supersede', decided_at=?
+               WHERE repo=? AND action=? AND target_path=? AND status='pending' AND id != ?""",
+            (sup_reason, now, repo, action, target_path, req_id),
+        )
 
     def get_request(self, key: str) -> dict[str, Any] | None:
         c = self._conn()
@@ -516,35 +500,23 @@ class ApproverStore:
 
     def list_requests(self, allowed_repos: frozenset[str], status: str | None = None,
                       limit: int = 200) -> list[dict[str, Any]]:
-        c = self._conn()
-        if "*" in allowed_repos:
-            if status:
-                rows = c.execute(
-                    "SELECT * FROM requests WHERE status=? ORDER BY created_at DESC LIMIT ?",
-                    (status, limit),
-                ).fetchall()
-            else:
-                rows = c.execute(
-                    "SELECT * FROM requests ORDER BY created_at DESC LIMIT ?",
-                    (limit,),
-                ).fetchall()
-            return [self._row_to_dict(r) for r in rows]
         if not allowed_repos:
             return []
-        placeholders = ",".join("?" for _ in allowed_repos)
-        params: list[Any] = sorted(allowed_repos)
+        clauses: list[str] = []
+        params: list[Any] = []
+        if "*" not in allowed_repos:
+            placeholders = ",".join("?" for _ in allowed_repos)
+            clauses.append(f"repo IN ({placeholders})")
+            params.extend(sorted(allowed_repos))
         if status:
-            params.extend([status, limit])
-            rows = c.execute(
-                f"SELECT * FROM requests WHERE repo IN ({placeholders}) AND status=? ORDER BY created_at DESC LIMIT ?",
-                params,
-            ).fetchall()
-        else:
-            params.append(limit)
-            rows = c.execute(
-                f"SELECT * FROM requests WHERE repo IN ({placeholders}) ORDER BY created_at DESC LIMIT ?",
-                params,
-            ).fetchall()
+            clauses.append("status=?")
+            params.append(status)
+        where = f"WHERE {' AND '.join(clauses)} " if clauses else ""
+        params.append(limit)
+        rows = self._conn().execute(
+            f"SELECT * FROM requests {where}ORDER BY created_at DESC LIMIT ?",
+            params,
+        ).fetchall()
         return [self._row_to_dict(r) for r in rows]
 
     def _decide_one_in_tx(self, c: sqlite3.Connection, req_id: str, mode: str, *, approver: str,
@@ -557,11 +529,8 @@ class ApproverStore:
         req = self._row_to_dict(row)
         if not can_access_repo(allowed_repos, req["repo"]):
             raise ForbiddenError(f"approver {approver!r} cannot access {req['repo']!r}")
-        if req["action"] == "suite.release":
-            if not is_suite_owner(allowed_repos, req["repo"]):
-                raise ForbiddenError(f"approver {approver!r} is not suite owner for {req['repo']!r}")
-            if mode == "delegate_30m":
-                raise ForbiddenError("suite.release cannot create delegations")
+        if req["action"] == "suite.release" and mode == "delegate_30m":
+            raise ForbiddenError("suite.release cannot create delegations")
         if req["status"] != "pending":
             return req
 
@@ -656,18 +625,17 @@ class ApproverStore:
     def list_delegations(self, allowed_repos: frozenset[str]) -> tuple[list[dict[str, Any]], list[str]]:
         c = self._conn()
         now = int(time.time())
-        rev_rows = c.execute("SELECT id FROM revocations ORDER BY id").fetchall()
-        rev = [str(r["id"]) for r in rev_rows]
-        if "*" in allowed_repos:
-            rows = c.execute("SELECT * FROM delegations WHERE expires_at > ? ORDER BY created_at DESC", (now,)).fetchall()
-            return [dict(r) for r in rows], rev
+        rev = self.list_revocations()
         if not allowed_repos:
             return [], rev
-        placeholders = ",".join("?" for _ in allowed_repos)
-        rows = c.execute(
-            f"SELECT * FROM delegations WHERE repo IN ({placeholders}) AND expires_at > ? ORDER BY created_at DESC",
-            [*sorted(allowed_repos), now],
-        ).fetchall()
+        if "*" in allowed_repos:
+            rows = c.execute("SELECT * FROM delegations WHERE expires_at > ? ORDER BY created_at DESC", (now,)).fetchall()
+        else:
+            placeholders = ",".join("?" for _ in allowed_repos)
+            rows = c.execute(
+                f"SELECT * FROM delegations WHERE repo IN ({placeholders}) AND expires_at > ? ORDER BY created_at DESC",
+                [*sorted(allowed_repos), now],
+            ).fetchall()
         return [dict(r) for r in rows], rev
 
     def revoke_id(self, target_id: str, *, allowed_repos: frozenset[str]) -> bool:

@@ -12,7 +12,6 @@ from pathlib import Path
 from approver.crypto import hash_passphrase
 from approver.server import create_server
 from approver.store import ApproverStore
-from approver.webhooks import RepoWebhookDispatcher
 
 
 def _http(url: str, *, method: str = "GET", body: dict | None = None,
@@ -36,8 +35,7 @@ class AutoSupersedeAndBatchTests(unittest.TestCase):
         pass_file = root / "admin.pass"
         pass_file.write_text(hash_passphrase("pw") + "\n", encoding="utf-8")
         self.store = ApproverStore(root / "state", pass_file)
-        self.dispatcher = RepoWebhookDispatcher(root / "wh.url", root / "dwh.url")
-        self.srv = create_server("127.0.0.1", 0, self.store, self.dispatcher)
+        self.srv = create_server("127.0.0.1", 0, self.store)
         self.url = f"http://127.0.0.1:{self.srv.server_address[1]}"
         threading.Thread(target=self.srv.serve_forever, daemon=True).start()
         self.tok_a = self.store.issue_thread_token("thread-a")
@@ -48,7 +46,6 @@ class AutoSupersedeAndBatchTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.srv.shutdown()
         self.srv.server_close()
-        self.dispatcher.flush_all()
         self.store.close()
         self._td.cleanup()
 

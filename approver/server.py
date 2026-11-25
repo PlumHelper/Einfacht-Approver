@@ -10,7 +10,6 @@ import urllib.parse
 from typing import Any
 
 from .store import ApproverStore, ForbiddenError, SuiteSeqConflictError
-from .webhooks import RepoWebhookDispatcher
 
 
 def _render_login(error: str = "") -> str:
@@ -179,8 +178,7 @@ def _render_dashboard(store: ApproverStore, allowed_repos: frozenset[str], appro
     )
 
 
-def make_handler(store: ApproverStore, dispatcher: RepoWebhookDispatcher,
-                 *, is_tls: bool = False) -> type[http.server.BaseHTTPRequestHandler]:
+def make_handler(store: ApproverStore, *, is_tls: bool = False) -> type[http.server.BaseHTTPRequestHandler]:
     class Handler(http.server.BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
 
@@ -235,14 +233,19 @@ def make_handler(store: ApproverStore, dispatcher: RepoWebhookDispatcher,
                     return ident
             return store.session_identity(self._session_id())
 
+        def _require_auth(self, *, wildcard_only: bool = False) -> tuple[str, frozenset[str]] | None:
+            ident = self._current_identity()
+            if not ident or (wildcard_only and "*" not in ident[1]):
+                self._json(403, {"error": "forbidden"})
+                return None
+            return ident
+
         def do_GET(self) -> None:
-            path = urllib.parse.urlparse(self.path).path
+            parsed = urllib.parse.urlparse(self.path)
+            path, qs = parsed.path, urllib.parse.parse_qs(parsed.query)
             if path == "/":
                 ident = self._current_identity()
-                if not ident:
-                    self._html(200, _render_login())
-                    return
-                self._html(200, _render_dashboard(store, ident[1], ident[0]))
+                self._html(200, _render_dashboard(store, ident[1], ident[0]) if ident else _render_login())
                 return
             if path == "/pubkey":
                 pub_pem, kid = store.key_info()
@@ -252,7 +255,6 @@ def make_handler(store: ApproverStore, dispatcher: RepoWebhookDispatcher,
                 self._json(200, {"revoked": store.list_revocations()})
                 return
             if path == "/receipts":
-                qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
                 repo_name = (qs.get("repo", [""])[0] or "").strip()
                 if not repo_name:
                     self._json(400, {"error": "missing_repo"})
@@ -264,23 +266,17 @@ def make_handler(store: ApproverStore, dispatcher: RepoWebhookDispatcher,
                 req = store.get_request(key)
                 self._json(200 if req else 404, req or {"error": "not_found"})
                 return
-            if path in ("/api/requests", "/api/pending"):
-                ident = self._current_identity()
+            if path in ("/api/requests", "/api/pending", "/api/delegations"):
+                ident = self._require_auth()
                 if not ident:
-                    self._json(403, {"error": "forbidden"})
                     return
-                qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+                if path == "/api/delegations":
+                    delegs, rev = store.list_delegations(ident[1])
+                    self._json(200, {"approver": ident[0], "allowed_repos": sorted(ident[1]), "delegations": delegs, "revoked": rev})
+                    return
                 status = qs.get("status", ["pending" if path == "/api/pending" else ""])[0] or None
                 items = store.list_requests(ident[1], status=status)
                 self._json(200, {"approver": ident[0], "allowed_repos": sorted(ident[1]), "requests": items, "pending": items})
-                return
-            if path == "/api/delegations":
-                ident = self._current_identity()
-                if not ident:
-                    self._json(403, {"error": "forbidden"})
-                    return
-                delegs, rev = store.list_delegations(ident[1])
-                self._json(200, {"approver": ident[0], "allowed_repos": sorted(ident[1]), "delegations": delegs, "revoked": rev})
                 return
             self._json(404, {"error": "not_found"})
 
@@ -310,89 +306,47 @@ def make_handler(store: ApproverStore, dispatcher: RepoWebhookDispatcher,
             parsed = urllib.parse.parse_qs(raw)
             return {k: v[0] for k, v in parsed.items() if v}
 
-        def do_POST(self) -> None:
-            path = urllib.parse.urlparse(self.path).path
-            raw = self._read_body()
-            if raw is None:
+        def _post_submit(self, raw: str) -> None:
+            try:
+                body = json.loads(raw or "{}")
+            except ValueError:
+                self._json(400, {"error": "bad_json"})
                 return
-            if path == "/requests":
-                try:
-                    body = json.loads(raw or "{}")
-                except ValueError:
-                    self._json(400, {"error": "bad_json"})
-                    return
-                if not isinstance(body, dict) or not all(str(body.get(k) or "").strip() for k in ("repo", "action", "target_path", "target_sha256")):
-                    self._json(400, {"error": "missing_fields"})
-                    return
-                try:
-                    req, is_new = store.submit_request(body)
-                except ValueError as exc:
-                    self._json(400, {"error": "bad_request", "detail": str(exc)})
-                    return
-                except SuiteSeqConflictError as exc:
-                    self._json(409, {"error": "suite_seq_conflict", "detail": str(exc)})
-                    return
-                if is_new:
-                    dispatcher.notify_request(req)
-                self._json(201 if is_new else 200, req)
+            if not isinstance(body, dict) or not all(str(body.get(k) or "").strip() for k in ("repo", "action", "target_path", "target_sha256")):
+                self._json(400, {"error": "missing_fields"})
                 return
+            try:
+                req, is_new = store.submit_request(body)
+            except ValueError as exc:
+                self._json(400, {"error": "bad_request", "detail": str(exc)})
+                return
+            except SuiteSeqConflictError as exc:
+                self._json(409, {"error": "suite_seq_conflict", "detail": str(exc)})
+                return
+            self._json(201 if is_new else 200, req)
 
-            if path == "/login":
-                data = self._parse_json_or_form(raw)
-                secret_val = str(data.get("passphrase") or "").strip()
-                pw_ident = store.verify_approver(secret_val)
-                if pw_ident:
-                    tok = store.create_session(pw_ident[0], pw_ident[1])
-                else:
-                    tok_ident = store.bearer_identity(secret_val)
-                    if not tok_ident:
-                        self._html(401, _render_login("Invalid passphrase"))
-                        return
-                    tok = store.create_session(tok_ident[0], frozenset())
-                sec = "; Secure" if is_tls else ""
-                self._redirect("/", cookie=f"approver_sess={tok}; HttpOnly; SameSite=Lax; Path=/{sec}")
-                return
-
-            if path == "/logout":
-                sess_tok = self._session_id()
-                if sess_tok:
-                    store.delete_session(sess_tok)
-                sec = "; Secure" if is_tls else ""
-                self._redirect("/", cookie=f"approver_sess=; Max-Age=0; Path=/{sec}")
-                return
-
-            if path in ("/api/keychain/bind", "/keychain"):
-                ident = self._current_identity()
-                if not ident or "*" not in ident[1]:
-                    self._json(403, {"error": "forbidden"})
+        def _post_login(self, raw: str) -> None:
+            data = self._parse_json_or_form(raw)
+            secret_val = str(data.get("passphrase") or "").strip()
+            pw_ident = store.verify_approver(secret_val)
+            if pw_ident:
+                tok = store.create_session(pw_ident[0], pw_ident[1])
+            else:
+                tok_ident = store.bearer_identity(secret_val)
+                if not tok_ident:
+                    self._html(401, _render_login("Invalid passphrase"))
                     return
-                data = self._parse_json_or_form(raw)
-                ap_name = str(data.get("approver") or "").strip()
-                repos_list = _parse_repos_field(data.get("repos") if data.get("repos") is not None else data.get("repo"))
-                if not ap_name or (not repos_list and not data.get("issue_token")):
-                    self._json(400, {"error": "missing_fields"})
-                    return
-                bound = store.bind_keychain_many(ap_name, repos_list)
-                issued_tok = store.issue_thread_token(ap_name) if data.get("issue_token") else None
-                if path == "/keychain":
-                    msg = f"Bound <code>{html.escape(ap_name)}</code> → <code>{html.escape(', '.join(bound or ['(unchanged)']))}</code>"
-                    if issued_tok:
-                        msg += f"<br>Token (copy into <code>request_secret</code>): <code>{html.escape(issued_tok)}</code>"
-                    self._html(200, _render_dashboard(store, ident[1], ident[0], banner=msg))
-                    return
-                out: dict[str, Any] = {"approver": ap_name, "repos": bound, "bound": True}
-                if issued_tok:
-                    out["token"] = issued_tok
-                self._json(200, out)
-                return
+                tok = store.create_session(tok_ident[0], frozenset())
+            sec = "; Secure" if is_tls else ""
+            self._redirect("/", cookie=f"approver_sess={tok}; HttpOnly; SameSite=Lax; Path=/{sec}")
 
+        def _post_keychain(self, path: str, raw: str) -> None:
+            ident = self._require_auth(wildcard_only=True)
+            if not ident:
+                return
+            data = self._parse_json_or_form(raw)
+            ap_name = str(data.get("approver") or "").strip()
             if path in ("/api/keychain/unbind", "/keychain/unbind"):
-                ident = self._current_identity()
-                if not ident or "*" not in ident[1]:
-                    self._json(403, {"error": "forbidden"})
-                    return
-                data = self._parse_json_or_form(raw)
-                ap_name = str(data.get("approver") or "").strip()
                 repo_name = str(data.get("repo") or "").strip()
                 if not ap_name or not repo_name:
                     self._json(400, {"error": "missing_fields"})
@@ -403,108 +357,93 @@ def make_handler(store: ApproverStore, dispatcher: RepoWebhookDispatcher,
                 else:
                     self._json(200, {"approver": ap_name, "repo": repo_name, "unbound": True})
                 return
-
-            if path in ("/api/decide", "/approve"):
-                ident = self._current_identity()
-                if not ident:
-                    self._json(403, {"error": "forbidden"})
-                    return
-                data = self._parse_json_or_form(raw)
-                req_id = str(data.get("req_id") or "")
-                mode = str(data.get("mode") or "single")
-                deny_reason = str(data.get("deny_reason") or "")
-                try:
-                    updated = store.decide_request(
-                        req_id, mode, approver=ident[0], allowed_repos=ident[1], deny_reason=deny_reason)
-                except ValueError as exc:
-                    self._json(400, {"error": "bad_mode", "detail": str(exc)})
-                    return
-                except ForbiddenError as exc:
-                    self._json(403, {"error": "forbidden", "detail": str(exc)})
-                    return
-                except SuiteSeqConflictError as exc:
-                    self._json(409, {"error": "suite_seq_conflict", "detail": str(exc)})
-                    return
-                if updated is None:
-                    self._json(404, {"error": "not_found"})
-                    return
-                dispatcher.notify_decision(updated)
-                if path == "/approve":
-                    self._redirect("/")
-                else:
-                    self._json(200, updated)
+            repos_list = _parse_repos_field(data.get("repos") if data.get("repos") is not None else data.get("repo"))
+            if not ap_name or (not repos_list and not data.get("issue_token")):
+                self._json(400, {"error": "missing_fields"})
                 return
-
-            if path == "/api/decide-batch":
-                ident = self._current_identity()
-                if not ident:
-                    self._json(403, {"error": "forbidden"})
-                    return
-                data = self._parse_json_or_form(raw)
-                decisions = data.get("decisions")
-                if not isinstance(decisions, list):
-                    self._json(400, {"error": "bad_request", "detail": "decisions must be a list"})
-                    return
-                try:
-                    results = store.decide_batch(decisions, approver=ident[0], allowed_repos=ident[1])
-                except ValueError as exc:
-                    self._json(400, {"error": "bad_request", "detail": str(exc)})
-                    return
-                except ForbiddenError as exc:
-                    self._json(403, {"error": "forbidden", "detail": str(exc)})
-                    return
-                except SuiteSeqConflictError as exc:
-                    self._json(409, {"error": "suite_seq_conflict", "detail": str(exc)})
-                    return
-                except KeyError:
-                    self._json(404, {"error": "not_found"})
-                    return
-                for item in results:
-                    dispatcher.notify_decision(item)
-                self._json(200, {"results": results})
+            bound = store.bind_keychain_many(ap_name, repos_list)
+            issued_tok = store.issue_thread_token(ap_name) if data.get("issue_token") else None
+            if path == "/keychain":
+                msg = f"Bound <code>{html.escape(ap_name)}</code> → <code>{html.escape(', '.join(bound or ['(unchanged)']))}</code>"
+                if issued_tok:
+                    msg += f"<br>Token (copy into <code>request_secret</code>): <code>{html.escape(issued_tok)}</code>"
+                self._html(200, _render_dashboard(store, ident[1], ident[0], banner=msg))
                 return
+            out: dict[str, Any] = {"approver": ap_name, "repos": bound, "bound": True}
+            if issued_tok:
+                out["token"] = issued_tok
+            self._json(200, out)
 
-            if path == "/api/withdraw":
-                ident = self._current_identity()
-                if not ident:
-                    self._json(403, {"error": "forbidden"})
+        def _post_decide_or_withdraw(self, path: str, raw: str) -> None:
+            ident = self._require_auth()
+            if not ident:
+                return
+            data = self._parse_json_or_form(raw)
+            try:
+                if path == "/api/decide-batch":
+                    decisions = data.get("decisions")
+                    if not isinstance(decisions, list):
+                        self._json(400, {"error": "bad_request", "detail": "decisions must be a list"})
+                        return
+                    self._json(200, {"results": store.decide_batch(decisions, approver=ident[0], allowed_repos=ident[1])})
                     return
-                data = self._parse_json_or_form(raw)
                 req_id = str(data.get("req_id") or "").strip()
-                if not req_id:
-                    self._json(400, {"error": "missing_req_id"})
-                    return
-                reason = str(data.get("reason") or "")
-                try:
-                    updated = store.withdraw_request(req_id, actor=ident[0], allowed_repos=ident[1], reason=reason)
-                except ForbiddenError as exc:
-                    self._json(403, {"error": "forbidden", "detail": str(exc)})
-                    return
+                if path == "/api/withdraw":
+                    if not req_id:
+                        self._json(400, {"error": "missing_req_id"})
+                        return
+                    updated = store.withdraw_request(req_id, actor=ident[0], allowed_repos=ident[1],
+                                                     reason=str(data.get("reason") or ""))
+                else:
+                    updated = store.decide_request(
+                        req_id, str(data.get("mode") or "single"),
+                        approver=ident[0], allowed_repos=ident[1], deny_reason=str(data.get("deny_reason") or ""))
                 if updated is None:
                     self._json(404, {"error": "not_found"})
                     return
-                self._json(200, updated)
-                return
+                self._redirect("/") if path == "/approve" else self._json(200, updated)
+            except ValueError as exc:
+                err_code = "bad_mode" if path in ("/api/decide", "/approve") else "bad_request"
+                self._json(400, {"error": err_code, "detail": str(exc)})
+            except ForbiddenError as exc:
+                self._json(403, {"error": "forbidden", "detail": str(exc)})
+            except SuiteSeqConflictError as exc:
+                self._json(409, {"error": "suite_seq_conflict", "detail": str(exc)})
+            except KeyError:
+                self._json(404, {"error": "not_found"})
 
-            if path in ("/api/revoke", "/revoke"):
-                ident = self._current_identity()
+        def do_POST(self) -> None:
+            path = urllib.parse.urlparse(self.path).path
+            raw = self._read_body()
+            if raw is None:
+                return
+            if path == "/requests":
+                self._post_submit(raw)
+            elif path == "/login":
+                self._post_login(raw)
+            elif path == "/logout":
+                sess_tok = self._session_id()
+                if sess_tok:
+                    store.delete_session(sess_tok)
+                sec = "; Secure" if is_tls else ""
+                self._redirect("/", cookie=f"approver_sess=; Max-Age=0; Path=/{sec}")
+            elif path in ("/api/keychain/bind", "/keychain", "/api/keychain/unbind", "/keychain/unbind"):
+                self._post_keychain(path, raw)
+            elif path in ("/api/decide", "/approve", "/api/decide-batch", "/api/withdraw"):
+                self._post_decide_or_withdraw(path, raw)
+            elif path in ("/api/revoke", "/revoke"):
+                ident = self._require_auth()
                 if not ident:
-                    self._json(403, {"error": "forbidden"})
                     return
-                data = self._parse_json_or_form(raw)
-                target_id = str(data.get("id") or "")
+                target_id = str(self._parse_json_or_form(raw).get("id") or "")
                 try:
                     store.revoke_id(target_id, allowed_repos=ident[1])
                 except ForbiddenError as exc:
                     self._json(403, {"error": "forbidden", "detail": str(exc)})
                     return
-                if path == "/revoke":
-                    self._redirect("/")
-                else:
-                    self._json(200, {"revoked": target_id})
-                return
-
-            self._json(404, {"error": "not_found"})
+                self._redirect("/") if path == "/revoke" else self._json(200, {"revoked": target_id})
+            else:
+                self._json(404, {"error": "not_found"})
 
     return Handler
 
@@ -536,10 +475,9 @@ class _TLSThreadingHTTPServer(http.server.ThreadingHTTPServer):
 
 
 def create_server(host: str, port: int, store: ApproverStore,
-                  dispatcher: RepoWebhookDispatcher,
                   ssl_context: ssl.SSLContext | None = None) -> http.server.ThreadingHTTPServer:
     """Create a `ThreadingHTTPServer` bound to `(host, port)` (HTTPS when `ssl_context` is given)."""
-    handler = make_handler(store, dispatcher, is_tls=ssl_context is not None)
+    handler = make_handler(store, is_tls=ssl_context is not None)
     if ssl_context is not None:
         return _TLSThreadingHTTPServer((host, port), handler, ssl_context)
     return http.server.ThreadingHTTPServer((host, port), handler)

@@ -14,7 +14,6 @@ from pathlib import Path
 from approver import crypto
 from approver.server import create_server
 from approver.store import ApproverStore
-from approver.webhooks import RepoWebhookDispatcher
 
 
 def _find_einfacht_root() -> Path:
@@ -55,14 +54,12 @@ class EinfachtFleetIntegrationTests(unittest.TestCase):
         self.owner_pw = "owner-secret"
         pass_file.write_text(f"owner:*:{crypto.hash_passphrase(self.owner_pw)}\n", encoding="utf-8")
         self.store = ApproverStore(root / "state", pass_file)
-        self.dispatcher = RepoWebhookDispatcher(root / "wh.url", root / "dec.url", debounce_sec=0.05)
-        self.srv = create_server("127.0.0.1", 0, self.store, self.dispatcher)
+        self.srv = create_server("127.0.0.1", 0, self.store)
         self.base_url = f"http://127.0.0.1:{self.srv.server_address[1]}"
         self.srv_thread = threading.Thread(target=self.srv.serve_forever, daemon=True)
         self.srv_thread.start()
 
     def tearDown(self) -> None:
-        self.dispatcher.flush_all()
         self.srv.shutdown()
         self.srv.server_close()
         self.store.close()
@@ -121,7 +118,7 @@ class EinfachtFleetIntegrationTests(unittest.TestCase):
             self.assertEqual(r_init.returncode, 0, r_init.stderr + r_init.stdout)
             trust.write_anchors(str(repo_dir), {
                 "schema": 1, "repo": f"org/app-{i}",
-                "approver_pub": self.store.pub_pem(), "lock_core": True,
+                "approver_pub": self.store.key_info()[0], "lock_core": True,
                 "revoked_ids": [], "suite_seq": 1, "suite_tree_sha256": "",
                 "knobs_sha256": trust.sha256_file(str(repo_dir / "knobs.json")) or "NONE", "questions_dir": "questions",
                 "custom_scripts": trust.local_scripts_map(str(repo_dir)),
@@ -147,7 +144,7 @@ class EinfachtFleetIntegrationTests(unittest.TestCase):
         for i in range(4):
             repo_dir = root / f"fleet-upgrade-{i}"
             anc = trust.load_anchors(str(repo_dir))
-            anc["approver_pub"] = self.store.pub_pem()
+            anc["approver_pub"] = self.store.key_info()[0]
             trust.write_anchors(str(repo_dir), anc)
             prev_sha = trust.sha256_file(str(repo_dir / "reflect-local" / "hook.py"))
             (repo_dir / "reflect-local" / "hook.py").write_text("# modified hook\n", encoding="utf-8")
