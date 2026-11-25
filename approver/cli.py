@@ -23,8 +23,6 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--tls-key", default=os.environ.get("APPROVER_TLS_KEY", "/etc/einfacht-approver/tls.key"))
     parser.add_argument("--state-dir", default=os.environ.get("APPROVER_STATE_DIR", "/var/lib/einfacht-approver"))
     parser.add_argument("--pass-file", default=os.environ.get("APPROVER_PASS_FILE", "/etc/einfacht-approver/admin.pass"))
-    parser.add_argument("--webhook-file", default=os.environ.get("APPROVER_WEBHOOK_FILE", "/etc/einfacht-approver/webhook.url"))
-    parser.add_argument("--decision-webhook-file", default=os.environ.get("APPROVER_DECISION_WEBHOOK_FILE", "/etc/einfacht-approver/decision-webhook.url"))
     parser.add_argument("--hash-pass", action="store_true", help="Read passphrase from stdin and print PBKDF2 hash")
     parser.add_argument("--issue-thread-token", nargs=1, metavar="THREAD_ID",
                         help="Issue a bearer token for THREAD_ID (combine with --repos to bind in one step)")
@@ -86,4 +84,5 @@ def main(argv: list[str] | None = None) -> int:
             tls_srv.shutdown()
             tls_srv.server_close()
         srv.server_close()
+        store.close()
     return 0

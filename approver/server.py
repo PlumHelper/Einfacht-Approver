@@ -185,6 +185,12 @@ def make_handler(store: ApproverStore, *, is_tls: bool = False) -> type[http.ser
         def log_message(self, format: str, *args: Any) -> None:
             return
 
+        def finish(self) -> None:
+            try:
+                super().finish()
+            finally:
+                store.close_thread_conn()
+
         def _json(self, code: int, obj: Any) -> None:
             body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
             self.send_response(code)
@@ -388,15 +394,17 @@ def make_handler(store: ApproverStore, *, is_tls: bool = False) -> type[http.ser
                     self._json(200, {"results": store.decide_batch(decisions, approver=ident[0], allowed_repos=ident[1])})
                     return
                 req_id = str(data.get("req_id") or "").strip()
+                if not req_id:
+                    self._json(400, {"error": "missing_req_id"})
+                    return
                 if path == "/api/withdraw":
-                    if not req_id:
-                        self._json(400, {"error": "missing_req_id"})
-                        return
                     updated = store.withdraw_request(req_id, actor=ident[0], allowed_repos=ident[1],
                                                      reason=str(data.get("reason") or ""))
                 else:
+                    raw_mode = data.get("mode")
+                    mode = "single" if raw_mode is None else str(raw_mode)
                     updated = store.decide_request(
-                        req_id, str(data.get("mode") or "single"),
+                        req_id, mode,
                         approver=ident[0], allowed_repos=ident[1], deny_reason=str(data.get("deny_reason") or ""))
                 if updated is None:
                     self._json(404, {"error": "not_found"})
