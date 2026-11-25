@@ -157,6 +157,110 @@ class AutoSupersedeAndBatchTests(unittest.TestCase):
         self.assertEqual(rec_a["receipts"][0]["target_sha256"], "p2")
         self.assertNotEqual(p1["id"], a_ok["id"])
 
+    def test_batch_rollback_and_empty_mode_and_suite_supersede(self) -> None:
+        hdr_a = {"Authorization": f"Bearer {self.tok_a}"}
+        _, r1 = _http(self.url + "/requests", method="POST", body={
+            "repo": "org/repo-a", "action": "gate.off",
+            "target_path": "check_x.py", "prev_sha256": "on", "target_sha256": "off",
+        })
+        # Batch with delegate_30m followed by invalid empty mode="" -> 400 and rolls back delegation too
+        c_bad, _ = _http(self.url + "/api/decide-batch", method="POST", headers=hdr_a, body={
+            "decisions": [
+                {"req_id": r1["id"], "mode": "delegate_30m"},
+                {"req_id": r1["id"], "mode": ""},
+            ],
+        })
+        self.assertEqual(c_bad, 400)
+        self.assertEqual(_http(self.url + f"/requests/{r1['id']}")[1]["status"], "pending")
+        _, del_resp = _http(self.url + "/api/delegations", headers=hdr_a)
+        self.assertEqual(del_resp["delegations"], [])
+
+        # Missing req_id rolls back prior valid decision
+        c_404, _ = _http(self.url + "/api/decide-batch", method="POST", headers=hdr_a, body={
+            "decisions": [
+                {"req_id": r1["id"], "mode": "single"},
+                {"req_id": "req-missing-999", "mode": "single"},
+            ],
+        })
+        self.assertEqual(c_404, 404)
+        self.assertEqual(_http(self.url + f"/requests/{r1['id']}")[1]["status"], "pending")
+
+        # suite.release: seq=3 supersedes seq=2; equal seq stays pending
+        _, sr2 = _http(self.url + "/requests", method="POST", body={
+            "repo": "org/repo-a", "action": "suite.release", "suite_seq": 2,
+            "target_path": "zreflect/SEAL.json", "prev_sha256": "t1", "target_sha256": "t2",
+        })
+        _, sr3a = _http(self.url + "/requests", method="POST", body={
+            "repo": "org/repo-a", "action": "suite.release", "suite_seq": 3,
+            "target_path": "zreflect/SEAL.json", "prev_sha256": "t1", "target_sha256": "t3a",
+        })
+        _, sr3b = _http(self.url + "/requests", method="POST", body={
+            "repo": "org/repo-a", "action": "suite.release", "suite_seq": 3,
+            "target_path": "zreflect/SEAL.json", "prev_sha256": "t1", "target_sha256": "t3b",
+        })
+        self.assertEqual(_http(self.url + f"/requests/{sr2['id']}")[1]["status"], "superseded")
+        self.assertEqual(_http(self.url + f"/requests/{sr3a['id']}")[1]["status"], "pending")
+        self.assertEqual(_http(self.url + f"/requests/{sr3b['id']}")[1]["status"], "pending")
+
+        # Empty withdraw returns 400; withdrawing sr3a then resubmitting creates fresh pending
+        self.assertEqual(_http(self.url + "/api/withdraw", method="POST", headers=hdr_a, body={"req_id": ""})[0], 400)
+        self.assertEqual(_http(self.url + "/api/withdraw", method="POST", headers=hdr_a, body={"req_id": sr3a["id"]})[0], 200)
+        _, sr3a_again = _http(self.url + "/requests", method="POST", body={
+            "repo": "org/repo-a", "action": "suite.release", "suite_seq": 3,
+            "target_path": "zreflect/SEAL.json", "prev_sha256": "t1", "target_sha256": "t3a",
+        })
+        self.assertEqual(sr3a_again["status"], "pending")
+        self.assertNotEqual(sr3a_again["id"], sr3a["id"])
+
+    def test_get_receipts_excludes_revoked_expired_and_survives_over_200_rows(self) -> None:
+        hdr_a = {"Authorization": f"Bearer {self.tok_a}"}
+        hdr_admin = {"X-Approver-Pass": "pw"}
+        # One delegate_30m receipt whose delegation gets revoked, plus one valid receipt
+        _, r_del_seed = _http(self.url + "/requests", method="POST", body={
+            "repo": "org/repo-a", "action": "question.modify",
+            "target_path": "questions/01.md", "prev_sha256": "a0", "target_sha256": "a1",
+        })
+        self.assertEqual(_http(self.url + "/api/decide", method="POST", headers=hdr_a, body={
+            "req_id": r_del_seed["id"], "mode": "delegate_30m",
+        })[0], 200)
+        del_id = _http(self.url + f"/requests/{r_del_seed['id']}")[1]["receipt"]["delegation_id"]
+        _, r_del_child = _http(self.url + "/requests", method="POST", body={
+            "repo": "org/repo-a", "action": "question.modify",
+            "target_path": "questions/02.md", "prev_sha256": "b0", "target_sha256": "b1",
+        })
+        self.assertEqual(r_del_child["status"], "approved_delegated")
+
+        _, r_keep = _http(self.url + "/requests", method="POST", body={
+            "repo": "org/repo-a", "action": "seal.core",
+            "target_path": "zreflect/SEAL.json", "prev_sha256": "s0", "target_sha256": "s_keep",
+        })
+        self.assertEqual(_http(self.url + "/api/decide", method="POST", headers=hdr_a, body={
+            "req_id": r_keep["id"], "mode": "single",
+        })[0], 200)
+
+        # Revoke delegation (must hide both r_del_seed and r_del_child)
+        self.assertEqual(_http(self.url + "/api/revoke", method="POST", headers=hdr_admin, body={"id": del_id})[0], 200)
+
+        # Insert 205 newer expired approved rows directly via store to verify LIMIT 200 doesn't evict r_keep
+        with self.store._tx() as c:
+            for idx in range(205):
+                rec = {"id": f"rec-exp-{idx}", "expires_at": 1000}
+                c.execute(
+                    """INSERT INTO requests(id, display_id, repo, agent_id, action, target_path,
+                           prev_sha256, target_sha256, diff_summary, target_content, status,
+                           decided_by, receipt_json, created_at, decided_at)
+                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (f"req-exp-{idx}", f"org/repo-a#{900 + idx}", "org/repo-a", "a",
+                     "question.modify", f"questions/exp_{idx}.md", "p0", f"t{idx}", "", "",
+                     "approved", "admin", json.dumps(rec), 2_000_000_000 + idx, 2_000_000_000 + idx),
+                )
+
+        code, rec_a = _http(self.url + "/receipts?repo=org/repo-a")
+        self.assertEqual(code, 200)
+        targets = [x["target_sha256"] for x in rec_a["receipts"]]
+        self.assertEqual(targets, ["s_keep"])
+
+
 
 if __name__ == "__main__":
     unittest.main()

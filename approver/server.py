@@ -184,7 +184,7 @@ def make_handler(store: ApproverStore, dispatcher: RepoWebhookDispatcher,
     class Handler(http.server.BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
 
-        def log_message(self, fmt: str, *args: Any) -> None:
+        def log_message(self, format: str, *args: Any) -> None:
             return
 
         def _json(self, code: int, obj: Any) -> None:
@@ -321,7 +321,7 @@ def make_handler(store: ApproverStore, dispatcher: RepoWebhookDispatcher,
                 except ValueError:
                     self._json(400, {"error": "bad_json"})
                     return
-                if not isinstance(body, dict) or not all(body.get(k) for k in ("repo", "action", "target_path", "target_sha256")):
+                if not isinstance(body, dict) or not all(str(body.get(k) or "").strip() for k in ("repo", "action", "target_path", "target_sha256")):
                     self._json(400, {"error": "missing_fields"})
                     return
                 try:
@@ -471,6 +471,9 @@ def make_handler(store: ApproverStore, dispatcher: RepoWebhookDispatcher,
                     return
                 data = self._parse_json_or_form(raw)
                 req_id = str(data.get("req_id") or "").strip()
+                if not req_id:
+                    self._json(400, {"error": "missing_req_id"})
+                    return
                 reason = str(data.get("reason") or "")
                 try:
                     updated = store.withdraw_request(req_id, actor=ident[0], allowed_repos=ident[1], reason=reason)
