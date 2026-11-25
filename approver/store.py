@@ -194,8 +194,11 @@ class ApproverStore:
     def key_info(self) -> tuple[str, str]:
         return self.pub_pem_str, self.key_id
 
-    def bind_keychain_many(self, approver: str, repos: list[str] | tuple[str, ...]) -> list[str]:
+    def bind_keychain_many(self, approver: str, repos: list[str] | tuple[str, ...],
+                           *, allowed_repos: frozenset[str] | None = None) -> list[str]:
         """Bind multiple `repos` to `approver`'s keychain in one transaction."""
+        if allowed_repos is not None and "*" not in allowed_repos:
+            raise ForbiddenError("only wildcard owner can modify keychains")
         cleaned = sorted({r.strip() for r in repos if r and r.strip()})
         if not cleaned:
             return []
@@ -208,8 +211,11 @@ class ApproverStore:
                 )
         return cleaned
 
-    def unbind_keychain(self, approver: str, repo: str) -> None:
+    def unbind_keychain(self, approver: str, repo: str,
+                        *, allowed_repos: frozenset[str] | None = None) -> None:
         """Remove `repo` from `approver`'s keychain."""
+        if allowed_repos is not None and "*" not in allowed_repos:
+            raise ForbiddenError("only wildcard owner can modify keychains")
         with self._write_lock:
             self._conn().execute(
                 "DELETE FROM approver_keychains WHERE approver=? AND repo=?",
@@ -226,8 +232,11 @@ class ApproverStore:
             out.setdefault(str(r["approver"]), []).append(str(r["repo"]))
         return out
 
-    def issue_thread_token(self, thread_id: str) -> str:
+    def issue_thread_token(self, thread_id: str,
+                           *, allowed_repos: frozenset[str] | None = None) -> str:
         """Issue a bearer token bound directly to `thread_id` (zero keypair/challenge)."""
+        if allowed_repos is not None and "*" not in allowed_repos:
+            raise ForbiddenError("only wildcard owner can issue thread tokens")
         import hashlib
         import secrets
         tok = "ef-tok-" + secrets.token_urlsafe(24)
@@ -372,7 +381,7 @@ class ApproverStore:
         target_content = str(body.get("target_content") or "")[:32000]
         raw_seq = body.get("suite_seq")
         if raw_seq is not None:
-            if isinstance(raw_seq, bool):
+            if isinstance(raw_seq, (bool, float)):
                 raise ValueError("invalid suite_seq")
             suite_seq: int | None = int(raw_seq)
         else:
@@ -529,6 +538,8 @@ class ApproverStore:
         req = self._row_to_dict(row)
         if not can_access_repo(allowed_repos, req["repo"]):
             raise ForbiddenError(f"approver {approver!r} cannot access {req['repo']!r}")
+        if req["action"] == "suite.release" and "*" not in allowed_repos:
+            raise ForbiddenError("suite.release requires wildcard ownership")
         if req["action"] == "suite.release" and mode == "delegate_30m":
             raise ForbiddenError("suite.release cannot create delegations")
         if req["status"] != "pending":

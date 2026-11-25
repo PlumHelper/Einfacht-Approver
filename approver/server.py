@@ -204,6 +204,8 @@ def make_handler(store: ApproverStore, *, is_tls: bool = False) -> type[http.ser
             self.send_response(code)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
+            self.send_header("X-Frame-Options", "DENY")
+            self.send_header("Cache-Control", "no-store")
             if cookie:
                 self.send_header("Set-Cookie", cookie)
             self.end_headers()
@@ -287,6 +289,9 @@ def make_handler(store: ApproverStore, *, is_tls: bool = False) -> type[http.ser
             self._json(404, {"error": "not_found"})
 
         def _read_body(self) -> str | None:
+            if "chunked" in (self.headers.get("Transfer-Encoding") or "").lower():
+                self._json(411, {"error": "chunked_unsupported"})
+                return None
             raw_len = self.headers.get("Content-Length", "0") or "0"
             try:
                 n = int(raw_len)
@@ -357,7 +362,7 @@ def make_handler(store: ApproverStore, *, is_tls: bool = False) -> type[http.ser
                 if not ap_name or not repo_name:
                     self._json(400, {"error": "missing_fields"})
                     return
-                store.unbind_keychain(ap_name, repo_name)
+                store.unbind_keychain(ap_name, repo_name, allowed_repos=ident[1])
                 if path == "/keychain/unbind":
                     self._redirect("/")
                 else:
@@ -367,8 +372,8 @@ def make_handler(store: ApproverStore, *, is_tls: bool = False) -> type[http.ser
             if not ap_name or (not repos_list and not data.get("issue_token")):
                 self._json(400, {"error": "missing_fields"})
                 return
-            bound = store.bind_keychain_many(ap_name, repos_list)
-            issued_tok = store.issue_thread_token(ap_name) if data.get("issue_token") else None
+            bound = store.bind_keychain_many(ap_name, repos_list, allowed_repos=ident[1])
+            issued_tok = store.issue_thread_token(ap_name, allowed_repos=ident[1]) if data.get("issue_token") else None
             if path == "/keychain":
                 msg = f"Bound <code>{html.escape(ap_name)}</code> → <code>{html.escape(', '.join(bound or ['(unchanged)']))}</code>"
                 if issued_tok:
@@ -420,8 +425,23 @@ def make_handler(store: ApproverStore, *, is_tls: bool = False) -> type[http.ser
             except KeyError:
                 self._json(404, {"error": "not_found"})
 
+        def _csrf_ok(self, path: str) -> bool:
+            if path == "/login" or self.headers.get("Authorization") or (self.headers.get("X-Approver-Pass") or "").strip():
+                return True
+            if not self._session_id():
+                return True
+            sfs = (self.headers.get("Sec-Fetch-Site") or "").strip().lower()
+            if sfs in ("cross-site", "same-site"):
+                return False
+            origin = (self.headers.get("Origin") or "").strip()
+            host = (self.headers.get("Host") or "").strip().lower()
+            return not origin or (bool(host) and urllib.parse.urlparse(origin).netloc.lower() == host)
+
         def do_POST(self) -> None:
             path = urllib.parse.urlparse(self.path).path
+            if not self._csrf_ok(path):
+                self._json(403, {"error": "csrf_rejected"})
+                return
             raw = self._read_body()
             if raw is None:
                 return
@@ -443,7 +463,10 @@ def make_handler(store: ApproverStore, *, is_tls: bool = False) -> type[http.ser
                 ident = self._require_auth()
                 if not ident:
                     return
-                target_id = str(self._parse_json_or_form(raw).get("id") or "")
+                target_id = str(self._parse_json_or_form(raw).get("id") or "").strip()
+                if not target_id:
+                    self._json(400, {"error": "missing_id"})
+                    return
                 try:
                     store.revoke_id(target_id, allowed_repos=ident[1])
                 except ForbiddenError as exc:

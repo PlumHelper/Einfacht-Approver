@@ -39,50 +39,46 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     store = ApproverStore(Path(args.state_dir), Path(args.pass_file))
-    if args.list_keychains:
-        for tid, repos in store.list_all_keychains().items():
-            print(f"{tid}: {', '.join(repos)}")
-        store.close()
-        return 0
-    if args.bind_keychain:
-        if len(args.bind_keychain) < 2:
-            store.close()
-            raise SystemExit("usage: --bind-keychain <THREAD_ID> <REPO1,REPO2,...>")
-        ap_name = args.bind_keychain[0]
-        raw_repos = [r for arg in args.bind_keychain[1:] for r in arg.split(",")]
-        bound = store.bind_keychain_many(ap_name, raw_repos)
-        store.close()
-        print(f"bound thread={ap_name!r} repos={bound}")
-        return 0
-    if args.issue_thread_token:
-        tid = args.issue_thread_token[0]
-        if args.repos:
-            store.bind_keychain_many(tid, args.repos.split(","))
-        tok = store.issue_thread_token(tid)
-        store.close()
-        print(tok)
-        return 0
-    srv = create_server(args.host, args.port, store)
+    srv = None
     tls_srv = None
-    if args.tls_port > 0:
-        cert_p, key_p = Path(args.tls_cert), Path(args.tls_key)
-        if not cert_p.is_file() or not key_p.is_file():
-            srv.server_close()
-            store.close()
-            raise SystemExit(f"missing TLS cert/key: {cert_p} / {key_p}")
-        ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-        ssl_ctx.minimum_version = ssl.TLSVersion.TLSv1_2
-        ssl_ctx.load_cert_chain(certfile=str(cert_p), keyfile=str(key_p))
-        tls_srv = create_server(args.tls_host, args.tls_port, store, ssl_context=ssl_ctx)
-        threading.Thread(target=tls_srv.serve_forever, name="approver-tls", daemon=True).start()
     try:
-        srv.serve_forever()
-    except KeyboardInterrupt:
-        pass
+        if args.list_keychains:
+            for tid, repos in store.list_all_keychains().items():
+                print(f"{tid}: {', '.join(repos)}")
+            return 0
+        if args.bind_keychain:
+            if len(args.bind_keychain) < 2:
+                raise SystemExit("usage: --bind-keychain <THREAD_ID> <REPO1,REPO2,...>")
+            ap_name = args.bind_keychain[0]
+            raw_repos = [r for arg in args.bind_keychain[1:] for r in arg.split(",")]
+            bound = store.bind_keychain_many(ap_name, raw_repos)
+            print(f"bound thread={ap_name!r} repos={bound}")
+            return 0
+        if args.issue_thread_token:
+            tid = args.issue_thread_token[0]
+            if args.repos:
+                store.bind_keychain_many(tid, args.repos.split(","))
+            print(store.issue_thread_token(tid))
+            return 0
+        srv = create_server(args.host, args.port, store)
+        if args.tls_port > 0:
+            cert_p, key_p = Path(args.tls_cert), Path(args.tls_key)
+            if not cert_p.is_file() or not key_p.is_file():
+                raise SystemExit(f"missing TLS cert/key: {cert_p} / {key_p}")
+            ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            ssl_ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+            ssl_ctx.load_cert_chain(certfile=str(cert_p), keyfile=str(key_p))
+            tls_srv = create_server(args.tls_host, args.tls_port, store, ssl_context=ssl_ctx)
+            threading.Thread(target=tls_srv.serve_forever, name="approver-tls", daemon=True).start()
+        try:
+            srv.serve_forever()
+        except KeyboardInterrupt:
+            pass
     finally:
         if tls_srv is not None:
             tls_srv.shutdown()
             tls_srv.server_close()
-        srv.server_close()
+        if srv is not None:
+            srv.server_close()
         store.close()
     return 0

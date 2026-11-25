@@ -450,6 +450,50 @@ class FleetStressTests(unittest.TestCase):
         self.assertEqual(fresh_req["status"], "pending")
         self.assertNotEqual(fresh_req["id"], req_exp["id"])
 
+        # 5. Scoped token bound explicitly to ArchivalEra/Einfacht CANNOT approve suite.release (needs '*')
+        self.store.bind_keychain_many("scoped-einfacht", ["ArchivalEra/Einfacht"])
+        scoped_tok = self.store.issue_thread_token("scoped-einfacht")
+        _, sr = _http(self.base_url + "/requests", method="POST", body={
+            "repo": "ArchivalEra/Einfacht", "action": "suite.release",
+            "target_path": "zreflect/SEAL.json", "prev_sha256": "0" * 64,
+            "target_sha256": "a" * 64, "suite_seq": 999,
+        })
+        c_sr, _ = _http(
+            self.base_url + "/api/decide", method="POST",
+            headers={"Authorization": f"Bearer {scoped_tok}"},
+            body={"req_id": sr["id"], "mode": "single"},
+        )
+        self.assertEqual(c_sr, 403)
+
+        # 6. Float suite_seq, empty /api/revoke, Transfer-Encoding: chunked, and CSRF cross-origin checks
+        c_flt, _ = _http(self.base_url + "/requests", method="POST", body={
+            "repo": "org/repo-01", "action": "gate.off", "target_path": "x.json",
+            "prev_sha256": "NONE", "target_sha256": "b" * 64, "suite_seq": 1.5,
+        })
+        self.assertEqual(c_flt, 400)
+        c_rev, _ = _http(self.base_url + "/api/revoke", method="POST",
+                         headers={"X-Approver-Pass": self.passes["owner"][0]}, body={"id": ""})
+        self.assertEqual(c_rev, 400)
+        self.assertEqual(crypto.parse_pass_entries("u::pw")["u"][0], frozenset())
+
+        conn2 = http.client.HTTPConnection(parsed.hostname or "127.0.0.1", parsed.port, timeout=5)
+        conn2.putrequest("POST", "/requests")
+        conn2.putheader("Transfer-Encoding", "chunked")
+        conn2.putheader("Content-Length", "0")
+        conn2.endheaders()
+        self.assertEqual(conn2.getresponse().status, 411)
+        conn2.close()
+
+        conn3 = http.client.HTTPConnection(parsed.hostname or "127.0.0.1", parsed.port, timeout=5)
+        conn3.putrequest("POST", "/api/revoke")
+        conn3.putheader("Cookie", "approver_sess=dummy")
+        conn3.putheader("Origin", "http://evil.example:9999")
+        conn3.putheader("Content-Length", "2")
+        conn3.endheaders()
+        conn3.send(b"{}")
+        self.assertEqual(conn3.getresponse().status, 403)
+        conn3.close()
+
 
 if __name__ == "__main__":
     unittest.main()

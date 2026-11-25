@@ -74,10 +74,10 @@ def parse_pass_entries(raw: str) -> dict[str, tuple[frozenset[str], str, str, bo
         elif len(parts) == 2:
             out["admin"] = (frozenset({"*"}), parts[0], parts[1], False)
         elif len(parts) == 3:
-            repos = frozenset(r.strip() for r in parts[1].split(",") if r.strip()) or frozenset({"*"})
+            repos = frozenset(r.strip() for r in parts[1].split(",") if r.strip())
             out[parts[0].strip()] = (repos, "", parts[2], True)
         elif len(parts) == 4:
-            repos = frozenset(r.strip() for r in parts[1].split(",") if r.strip()) or frozenset({"*"})
+            repos = frozenset(r.strip() for r in parts[1].split(",") if r.strip())
             out[parts[0].strip()] = (repos, parts[2], parts[3], False)
     return out
 
