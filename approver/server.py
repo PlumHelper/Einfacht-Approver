@@ -251,6 +251,14 @@ def make_handler(store: ApproverStore, dispatcher: RepoWebhookDispatcher,
             if path == "/revocations":
                 self._json(200, {"revoked": store.list_revocations()})
                 return
+            if path == "/receipts":
+                qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+                repo_name = (qs.get("repo", [""])[0] or "").strip()
+                if not repo_name:
+                    self._json(400, {"error": "missing_repo"})
+                    return
+                self._json(200, {"repo": repo_name, "receipts": store.list_approved_receipts(repo_name)})
+                return
             if path.startswith("/requests/"):
                 key = urllib.parse.unquote(path.split("/", 2)[2])
                 req = store.get_request(key)

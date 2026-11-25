@@ -130,6 +130,33 @@ class AutoSupersedeAndBatchTests(unittest.TestCase):
         _, a2_stay = _http(self.url + "/api/withdraw", method="POST", headers=hdr_a, body={"req_id": a2["id"]})
         self.assertEqual(a2_stay["status"], "denied")
 
+    def test_get_receipts_readonly_filtered(self) -> None:
+        hdr_a = {"Authorization": f"Bearer {self.tok_a}"}
+        hdr_b = {"Authorization": f"Bearer {self.tok_b}"}
+        _, p1 = _http(self.url + "/requests", method="POST", body={
+            "repo": "org/repo-a", "action": "seal.core",
+            "target_path": "zreflect/SEAL.json", "prev_sha256": "p0", "target_sha256": "p1",
+        })
+        _, a_ok = _http(self.url + "/requests", method="POST", body={
+            "repo": "org/repo-a", "action": "seal.core",
+            "target_path": "zreflect/SEAL.json", "prev_sha256": "p0", "target_sha256": "p2",
+        })
+        _, b_ok = _http(self.url + "/requests", method="POST", body={
+            "repo": "org/repo-b", "action": "gate.off",
+            "target_path": "knobs.json", "prev_sha256": "on", "target_sha256": "off",
+        })
+        self.assertEqual(_http(self.url + "/api/decide", method="POST", headers=hdr_a,
+                               body={"req_id": a_ok["id"], "mode": "single"})[0], 200)
+        self.assertEqual(_http(self.url + "/api/decide", method="POST", headers=hdr_b,
+                               body={"req_id": b_ok["id"], "mode": "single"})[0], 200)
+
+        self.assertEqual(_http(self.url + "/receipts")[0], 400)
+        code, rec_a = _http(self.url + "/receipts?repo=org/repo-a")
+        self.assertEqual(code, 200)
+        self.assertEqual(len(rec_a["receipts"]), 1)
+        self.assertEqual(rec_a["receipts"][0]["target_sha256"], "p2")
+        self.assertNotEqual(p1["id"], a_ok["id"])
+
 
 if __name__ == "__main__":
     unittest.main()

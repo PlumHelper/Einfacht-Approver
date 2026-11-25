@@ -6,6 +6,7 @@ import sqlite3
 import threading
 import time
 import uuid
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -701,3 +702,45 @@ class ApproverStore:
     def list_revocations(self) -> list[str]:
         rows = self._conn().execute("SELECT id FROM revocations ORDER BY id").fetchall()
         return [str(r["id"]) for r in rows]
+
+    def list_approved_receipts(self, repo: str, *, include_expired: bool = False) -> list[dict[str, Any]]:
+        """Read-only fetch of signed receipts for `repo` (newest per `(action, target, prev, target_sha)`)."""
+        now = int(time.time())
+        rows = self._conn().execute(
+            """SELECT action, target_path, prev_sha256, target_sha256, receipt_json
+               FROM requests
+               WHERE repo=? AND status IN ('approved', 'approved_delegated') AND receipt_json IS NOT NULL
+               ORDER BY COALESCE(decided_at, created_at) DESC, created_at DESC LIMIT 200""",
+            (repo,),
+        ).fetchall()
+        out: list[dict[str, Any]] = []
+        seen: set[tuple[str, str, str, str]] = set()
+        for r in rows:
+            key = (str(r["action"]), str(r["target_path"]), str(r["prev_sha256"]), str(r["target_sha256"]))
+            if key in seen:
+                continue
+            try:
+                rec = json.loads(str(r["receipt_json"]))
+            except ValueError:
+                continue
+            if not isinstance(rec, dict):
+                continue
+            body = rec["payload"] if isinstance(rec.get("payload"), dict) else rec
+            if not include_expired:
+                raw_exp = body.get("expires_at")
+                exp_ts: float | None = None
+                if isinstance(raw_exp, (int, float)):
+                    exp_ts = float(raw_exp)
+                elif isinstance(raw_exp, str) and raw_exp:
+                    try:
+                        exp_ts = float(raw_exp)
+                    except ValueError:
+                        try:
+                            exp_ts = datetime.fromisoformat(raw_exp).timestamp()
+                        except ValueError:
+                            exp_ts = None
+                if exp_ts is None or exp_ts <= now:
+                    continue
+            seen.add(key)
+            out.append(rec)
+        return out
