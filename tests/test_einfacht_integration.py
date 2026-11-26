@@ -166,6 +166,81 @@ class EinfachtFleetIntegrationTests(unittest.TestCase):
             ok_probs = trust.check_knobs_anchor(root=str(repo_dir), receipt=dec["receipt"])
             self.assertEqual(ok_probs, [])
 
+    def test_q39_q40_suite_lifetime_and_legacy_upgrade_compatibility(self) -> None:
+        import subprocess
+        from unittest.mock import patch
+
+        import trust  # type: ignore[import-not-found]
+        import trust_core  # type: ignore[import-not-found]
+
+        from approver.store import SUITE_RELEASE_COMPAT_EXPIRES_AT
+
+        root = Path(self.tmp.name)
+        suite_dir = root / "suite_latest"
+        seal_d = self._make_suite(suite_dir, seq=10)
+        sig = json.loads((suite_dir / "zreflect" / "SUITE.sig").read_text("utf-8"))
+        sig_body = trust_core.receipt_body(sig)
+        self.assertEqual(sig_body["expires_at"], SUITE_RELEASE_COMPAT_EXPIRES_AT)
+
+        # Normal seal.core stays short-lived (~3600s), while suite.release stays active far beyond 1h
+        normal_sub = _post_json(self.base_url + "/requests", {
+            "repo": "org/compat", "action": "gate.off", "target_path": "knobs.json",
+            "prev_sha256": "NONE", "target_sha256": "f" * 64,
+        })
+        normal_dec = _post_json(
+            self.base_url + "/api/decide",
+            {"req_id": normal_sub["id"], "mode": "single"},
+            headers={"X-Approver-Pass": self.owner_pw},
+        )
+        n_pay = trust_core.receipt_body(normal_dec["receipt"])
+        self.assertLessEqual(n_pay["expires_at"] - n_pay["issued_at"], 3700)
+
+        with patch("approver.store.time.time", return_value=sig_body["issued_at"] + 7200):
+            active = self.store.list_approved_receipts("ArchivalEra/Einfacht")
+            self.assertTrue(any(trust_core.receipt_body(r)["id"] == sig_body["id"] for r in active))
+
+        # New verify_suite_sig accepts compat timestamp, omitted expires_at, and past expires_at,
+        # while still blocking revocation, upstream spoofing, and hash/seq mismatch
+        pub = self.store.key_info()[0]
+        self.assertEqual(trust_core.verify_suite_sig(seal_d, sig, pub_b64=pub, verify_sig_fn=trust.ed25519_verify), [])
+        no_exp = crypto.sign_receipt(self.store.priv, {k: v for k, v in sig_body.items() if k not in ("expires_at", "sig")})
+        self.assertEqual(trust_core.verify_suite_sig(seal_d, no_exp, pub_b64=pub, verify_sig_fn=trust.ed25519_verify), [])
+        past_exp = crypto.sign_receipt(self.store.priv, {**{k: v for k, v in sig_body.items() if k != "sig"}, "expires_at": 946684800})
+        self.assertEqual(trust_core.verify_suite_sig(seal_d, past_exp, pub_b64=pub, verify_sig_fn=trust.ed25519_verify), [])
+        self.assertEqual(
+            [p.code for p in trust_core.verify_suite_sig(
+                seal_d, sig, pub_b64=pub, revoked_ids=[sig_body["id"]], verify_sig_fn=trust.ed25519_verify)],
+            ["approval.revoked"],
+        )
+
+        # Unlocked legacy v1 consumer lacking PRINCIPLES.md & containing doc_py_sha256 + custom_scripts + pre-push
+        legacy_repo = root / "legacy-unlocked"
+        shutil.copytree(EINFACHT_ZREFLECT, legacy_repo / "zreflect",
+                        ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "SUITE.sig"))
+        shutil.copy2(EINFACHT_ROOT / "ruff.toml", legacy_repo / "ruff.toml")
+        subprocess.run(["git", "init", "-q", str(legacy_repo)], check=True)
+        stale_pp = legacy_repo / ".git" / "hooks" / "pre-push"
+        stale_pp.write_text("#!/bin/sh\nexec python3 reflect-local/hook.py pre-push\n", encoding="utf-8")
+        subprocess.run([sys.executable, "zreflect/facts.py", "--init"], check=True, cwd=legacy_repo,
+                       capture_output=True, text=True)
+        (legacy_repo / "PRINCIPLES.md").unlink()
+        trust.write_anchors(str(legacy_repo), {
+            "schema": 1, "repo": "org/legacy-unlocked", "approver_pub": pub, "lock_core": False,
+            "revoked_ids": [], "suite_seq": 1, "suite_tree_sha256": "",
+            "knobs_sha256": trust.sha256_file(str(legacy_repo / "knobs.json")) or "NONE",
+            "questions_dir": "questions", "custom_scripts": {}, "off_gates": [],
+            "principles": {"doc_py_sha256": "stale", "principles_md_sha256": "stale", "no_principles": False},
+            "questions": {},
+        })
+        r_upg = subprocess.run([sys.executable, "zreflect/trust.py", "--upgrade", str(suite_dir)],
+                               check=False, cwd=legacy_repo, capture_output=True, text=True)
+        self.assertEqual(r_upg.returncode, 0, r_upg.stderr + r_upg.stdout)
+        anc = trust.load_anchors(str(legacy_repo))
+        self.assertEqual(anc["schema"], 2)
+        self.assertNotIn("doc_py_sha256", anc["principles"])
+        self.assertFalse(stale_pp.exists())
+        self.assertEqual(trust.check_principles_repo(root=str(legacy_repo), receipt={"receipts": []}), [])
+
 
 if __name__ == "__main__":
     unittest.main()

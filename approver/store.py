@@ -107,6 +107,9 @@ def can_access_repo(allowed_repos: frozenset[str], repo: str) -> bool:
     return "*" in allowed_repos or repo in allowed_repos
 
 
+SUITE_RELEASE_COMPAT_EXPIRES_AT = 4102444800  # 2100-01-01T00:00:00Z compat for un-upgraded v2 clients
+
+
 class SuiteSeqConflictError(Exception):
     """Raised when a concurrent `suite.release` collides with or regresses `last_seq`."""
 
@@ -350,6 +353,7 @@ class ApproverStore:
     def _sign_req_receipt(self, req: dict[str, Any], *, decided_by: str,
                           delegation_id: str | None = None, ttl_sec: int = 3600) -> dict[str, Any]:
         now = int(time.time())
+        exp = SUITE_RELEASE_COMPAT_EXPIRES_AT if req["action"] == "suite.release" else now + ttl_sec
         payload: dict[str, Any] = {
             "id": f"rec-{uuid.uuid4().hex[:12]}",
             "req_id": req["id"],
@@ -361,7 +365,7 @@ class ApproverStore:
             "target_sha256": req["target_sha256"],
             "decided_by": decided_by,
             "issued_at": now,
-            "expires_at": now + ttl_sec,
+            "expires_at": exp,
         }
         if req.get("suite_seq") is not None:
             payload["suite_seq"] = int(req["suite_seq"])
